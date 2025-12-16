@@ -24,8 +24,8 @@ using storage_handle_t = int; // e.g., a file descriptor, or an iRODS file handl
 
 // Callbacks for the library to interact with the real storage
 struct storage_operations_t {
-    std::function<ssize_t(storage_handle_t, const void*, size_t)> write;
-    std::function<ssize_t(storage_handle_t, void*, size_t)> read;
+    std::function<ssize_t(storage_handle_t, const void*, size_t, off_t)> pwrite;
+    std::function<ssize_t(storage_handle_t, void*, size_t, off_t)> pread;
     std::function<off_t(storage_handle_t, off_t, int)> lseek;
 };
 
@@ -50,5 +50,25 @@ off_t conveyor_lseek(conveyor_t* conv, off_t offset, int whence);
 
 // Forces a flush of the write-buffer to the underlying storage
 int conveyor_flush(conveyor_t* conv);
+
+// Statistics structure for observability
+struct conveyor_stats_t {
+    // Volume in the last window
+    size_t bytes_written;
+    size_t bytes_read;
+
+    // Latency in the last window (in milliseconds)
+    size_t avg_write_latency_ms;
+    size_t avg_read_latency_ms;
+
+    // Congestion events in the last window
+    size_t write_buffer_full_events;
+
+    // Persistent sticky error code
+    int last_error_code;
+};
+
+// Retrieves the latest statistics, resetting the counters for the next window.
+int conveyor_get_stats(conveyor_t* conv, conveyor_stats_t* stats);
 
 #endif // LIBCONVEYOR_CONVEYOR_HPP
