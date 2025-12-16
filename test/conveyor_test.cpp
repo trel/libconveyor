@@ -10,6 +10,7 @@
 #include <chrono>
 #include <atomic>
 #include <random>
+#include <iostream>
 
 // --- Mock Infrastructure ---
 static std::vector<char> g_mock_storage_data;
@@ -272,7 +273,13 @@ void test_random_seek_stress() {
     std::uniform_int_distribution<int> len_dist(1, 32);
     std::uniform_int_distribution<int> char_dist('B', 'Z');
 
+    const auto start_time = std::chrono::steady_clock::now();
+    const std::chrono::seconds timeout(30);
+
     for (int i = 0; i < 200; ++i) {
+        auto now = std::chrono::steady_clock::now();
+        assert(now - start_time < timeout && "Test timed out!");
+
         off_t seek_pos = pos_dist(rng);
         conveyor_lseek(conv, seek_pos, SEEK_SET);
 
