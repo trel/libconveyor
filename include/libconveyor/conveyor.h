@@ -1,33 +1,69 @@
-#ifndef LIBCONVEYOR_CONVEYOR_HPP
-#define LIBCONVEYOR_CONVEYOR_HPP
+#ifndef LIBCONVEYOR_CONVEYOR_H
+#define LIBCONVEYOR_CONVEYOR_H
 
-#include <functional>
-#include <cstddef> // For size_t
-#include <fcntl.h> // For O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
+#include <functional> // For std::function
+#include <cstddef>    // For size_t
 
 // MSVC specific definitions for ssize_t and off_t if they are not defined by other headers
 #if defined(_MSC_VER)
 #include <BaseTsd.h> // For SSIZE_T
-typedef SSIZE_T ssize_t;
-typedef long off_t; // off_t is typically long on 32-bit and 64-bit Windows when not using _FILE_OFFSET_BITS=64
+#include <io.h>     // For _lseek, _read, _write
+#include <fcntl.h>  // For _O_RDONLY, _O_WRONLY, _O_RDWR, _O_APPEND, _O_CREAT, _O_TRUNC
+#define O_RDONLY _O_RDONLY
+#define O_WRONLY _O_WRONLY
+#define O_RDWR   _O_RDWR
+#define O_APPEND _O_APPEND
+#define O_CREAT  _O_CREAT
+#define O_TRUNC  _O_TRUNC
+#define S_IREAD  _S_IREAD
+#define S_IWRITE _S_IWRITE
+// Define O_ACCMODE for Windows if not present
+#ifndef O_ACCMODE
+#define O_ACCMODE (O_RDONLY | O_WRONLY | O_RDWR)
+#endif
+typedef long off_t;
+typedef int ssize_t; // Windows doesn't have ssize_t, use int for signed size
 #else
 #include <sys/types.h> // For off_t, ssize_t on POSIX systems
+#include <unistd.h> // For lseek, read, write
+#include <fcntl.h>  // For O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, O_CREAT, O_TRUNC, O_ACCMODE
 #endif
 
-#define LIBCONVEYOR_ERROR -1
+#define LIBCONVEYOR_ERROR (-1)
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // Opaque handle to the conveyor object
-struct conveyor_t;
+typedef struct conveyor_t conveyor_t;
 
-// Represents the underlying storage to be buffered
-using storage_handle_t = int; // e.g., a file descriptor, or an iRODS file handle
+// Represents the underlying storage handle
+typedef int storage_handle_t; // e.g., a file descriptor, or an iRODS file handle
 
 // Callbacks for the library to interact with the real storage
-struct storage_operations_t {
-    std::function<ssize_t(storage_handle_t, const void*, size_t, off_t)> pwrite;
-    std::function<ssize_t(storage_handle_t, void*, size_t, off_t)> pread;
-    std::function<off_t(storage_handle_t, off_t, int)> lseek;
-};
+typedef struct {
+    ssize_t (*pwrite)(storage_handle_t, const void*, size_t, off_t);
+    ssize_t (*pread)(storage_handle_t, void*, size_t, off_t);
+    off_t   (*lseek)(storage_handle_t, off_t, int);
+} storage_operations_t;
+
+// Statistics structure for observability
+typedef struct {
+    // Volume in the last window
+    size_t bytes_written;
+    size_t bytes_read;
+
+    // Latency in the last window (in milliseconds)
+    size_t avg_write_latency_ms;
+    size_t avg_read_latency_ms;
+
+    // Congestion events in the last window
+    size_t write_buffer_full_events;
+
+    // Persistent sticky error code
+    int last_error_code;
+} conveyor_stats_t;
 
 // --- API Functions ---
 
@@ -35,7 +71,7 @@ struct storage_operations_t {
 conveyor_t* conveyor_create(
     storage_handle_t handle,
     int flags, // The flags from the open() call, e.g., O_RDWR | O_APPEND
-    const storage_operations_t& ops,
+    const storage_operations_t* ops,
     size_t write_buffer_size,
     size_t read_buffer_size
 );
@@ -51,24 +87,14 @@ off_t conveyor_lseek(conveyor_t* conv, off_t offset, int whence);
 // Forces a flush of the write-buffer to the underlying storage
 int conveyor_flush(conveyor_t* conv);
 
-// Statistics structure for observability
-struct conveyor_stats_t {
-    // Volume in the last window
-    size_t bytes_written;
-    size_t bytes_read;
-
-    // Latency in the last window (in milliseconds)
-    size_t avg_write_latency_ms;
-    size_t avg_read_latency_ms;
-
-    // Congestion events in the last window
-    size_t write_buffer_full_events;
-
-    // Persistent sticky error code
-    int last_error_code;
-};
-
 // Retrieves the latest statistics, resetting the counters for the next window.
 int conveyor_get_stats(conveyor_t* conv, conveyor_stats_t* stats);
 
-#endif // LIBCONVEYOR_CONVEYOR_HPP
+#ifdef __cplusplus
+} // End extern "C" block
+#endif
+
+// C++-only declarations
+
+
+#endif // LIBCONVEYOR_CONVEYOR_H
