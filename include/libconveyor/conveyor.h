@@ -90,6 +90,9 @@ int conveyor_flush(conveyor_t* conv);
 // Retrieves the latest statistics, resetting the counters for the next window.
 int conveyor_get_stats(conveyor_t* conv, conveyor_stats_t* stats);
 
+// Stops the worker threads without destroying the conveyor object
+void conveyor_stop(conveyor_t* conv);
+
 } // End extern "C" block
 
 // C++-only declarations

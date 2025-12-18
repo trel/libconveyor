@@ -436,3 +436,18 @@ int conveyor_get_stats(conveyor_t* conv, conveyor_stats_t* stats) {
 
     return 0;
 }
+
+void conveyor_stop(conveyor_t* conv) {
+    if (!conv) return;
+    auto* impl = reinterpret_cast<libconveyor::ConveyorImpl*>(conv);
+    if (impl->read_buffer_enabled) {
+        impl->read_worker_stop_flag = true;
+        impl->read_cv_producer.notify_all();
+        impl->read_cv_consumer.notify_all();
+    }
+    if (impl->write_buffer_enabled) {
+        impl->write_worker_stop_flag = true;
+        impl->write_cv_producer.notify_all();
+        impl->write_cv_consumer.notify_all();
+    }
+}

@@ -404,6 +404,10 @@ void test_destructor_teardown_race() {
         reset_mock_storage();
         g_pread_block_promise = std::promise<void>();
         g_pread_block_future = g_pread_block_promise.get_future();
+        
+        std::promise<void> read_thread_started_promise;
+        std::future<void> read_thread_started_future = read_thread_started_promise.get_future();
+
         storage_operations_t mock_ops = {mock_pwrite, mock_pread_block, mock_lseek};
 
         conveyor_t* conv = conveyor_create(1, O_RDONLY, &mock_ops, 0, 4096);
@@ -411,15 +415,19 @@ void test_destructor_teardown_race() {
 
         std::thread read_thread([&]() {
             char read_buf[10];
+            read_thread_started_promise.set_value();
             conveyor_read(conv, read_buf, 10);
         });
 
+        read_thread_started_future.wait();
         // Unblock the pread so the worker thread can finish
         g_pread_block_promise.set_value();
         
+        conveyor_stop(conv);
+        read_thread.join();
+        
         // Immediately destroy the conveyor
         conveyor_destroy(conv);
-        read_thread.join();
     }
 }
 
