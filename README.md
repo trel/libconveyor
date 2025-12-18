@@ -19,6 +19,90 @@
 *   **Robust Error Handling:** Detects and reports the first asynchronous I/O error to the user via sticky error codes, with a mechanism to clear them (`conveyor_clear_error`).
 *   **Fail-Fast for Invalid Writes:** Prevents indefinite hangs by failing writes that exceed the buffer's total capacity or timing out if space is not available.
 
+## Modern C++23 Interface (`conveyor_modern.hpp`)
+
+For modern C++ applications, `libconveyor` provides a header-only C++23 wrapper that offers enhanced safety, expressiveness, and an impossible-to-misuse API. It uses RAII, `std::expected` for error handling, and `std::span` for buffer safety, incurring zero runtime overhead.
+
+### Key Improvements
+
+#### 1. Safety via `std::span` & Concepts
+Instead of manually passing pointers and sizes, which risks buffer overflows, the modern API uses `std::span` and a concept `ByteContiguous` that accepts `std::vector`, `std::string`, or `std::array` directly, making size mismatches impossible.
+
+```cpp
+// OLD C-style API
+// conveyor_write(c, ptr, 100); // Risk: What if ptr only has 50 bytes?
+
+// NEW C++23 API
+std::string data = "Hello C++23";
+// Automatically calculates size, impossible to mismatch
+auto result = conveyor.write(data); 
+```
+
+#### 2. Error Handling via `std::expected`
+The new API returns a `std::expected` object, which either contains the result value or a strongly-typed `std::error_code`, eliminating the need to check for -1 and read the global `errno`.
+
+```cpp
+auto result = conveyor.write(data);
+if (!result) {
+    // result.error() contains the std::error_code
+    std::cerr << "Write failed: " << result.error().message() << "\n";
+}
+```
+
+#### 3. Automatic Resource Management (RAII)
+The `Conveyor` class wraps the raw C-style pointer in a `std::unique_ptr` with a custom deleter. The destructor automatically calls `conveyor_destroy`, which in turn flushes any pending writes. This prevents resource leaks and data loss from forgetting to clean up.
+
+### Modern Usage Example
+
+```cpp
+#include "libconveyor/conveyor_modern.hpp"
+#include <iostream>
+#include <vector>
+
+// Dummy storage operations for the example
+ssize_t my_pwrite(storage_handle_t, const void*, size_t count, off_t) { return count; }
+ssize_t my_pread(storage_handle_t, void*, size_t count, off_t) { return count; }
+off_t my_lseek(storage_handle_t, off_t offset, int) { return offset; }
+
+void modern_usage_example() {
+    storage_operations_t ops = { my_pwrite, my_pread, my_lseek };
+    
+    // 1. Create with designated initializers (C++20 feature)
+    auto result = libconveyor::v2::Conveyor::create({
+        .handle = nullptr, // Using a dummy handle for this example
+        .ops = ops,
+        .write_capacity = 5 * 1024 * 1024
+    });
+
+    if (!result) {
+        std::cerr << "Failed to init: " << result.error().message() << std::endl;
+        return;
+    }
+
+    // Move ownership to local variable
+    auto conveyor = std::move(result.value());
+
+    // 2. Write using a std::vector (no size param needed)
+    std::vector<int> numbers = {1, 2, 3, 4, 5};
+    
+    // The .and_then() chain allows functional-style error handling (C++23)
+    conveyor.write(numbers)
+        .and_then([&](size_t written) -> std::expected<void, std::error_code> {
+            std::cout << "Wrote " << written << " bytes\n";
+            return conveyor.flush();
+        })
+        .or_else([](std::error_code e) -> std::expected<void, std::error_code> {
+            std::cerr << "IO Error: " << e.message() << "\n";
+            return std::unexpected(e);
+        });
+
+    // 3. Stats with strong types
+    auto stats = conveyor.stats();
+    std::cout << "Avg Latency: " << stats.avg_write_latency.count() << "ms\n";
+
+} // Destructor for 'conveyor' runs here -> Flushes remaining data -> Destroys threads
+```
+
 ## Motivation
 
 This library was developed as a foundational component to enhance I/O performance within data management systems, particularly for creating pass-through resource plugins for systems like iRODS. By buffering I/O, `libconveyor` can significantly reduce perceived latency for client applications, making operations feel more responsive even when interacting with slow or distant storage.
@@ -221,3 +305,96 @@ int main() {
     unlink("example_storage.bin");
     return 0;
 }
+
+## Modern C++23 Interface (`conveyor_modern.hpp`)
+
+For modern C++ applications, `libconveyor` provides a header-only C++23 wrapper that offers enhanced safety, expressiveness, and an impossible-to-misuse API. It uses RAII, `std::expected` for error handling, and `std::span` for buffer safety, incurring zero runtime overhead.
+
+### Key Improvements
+
+#### 1. Safety via `std::span` & Concepts
+Instead of manually passing pointers and sizes, which risks buffer overflows, the modern API uses `std::span` and a concept `ByteContiguous` that accepts `std::vector`, `std::string`, or `std::array` directly, making size mismatches impossible.
+
+```cpp
+// OLD C-style API
+// conveyor_write(c, ptr, 100); // Risk: What if ptr only has 50 bytes?
+
+// NEW C++23 API
+std::string data = "Hello C++23";
+// Automatically calculates size, impossible to mismatch
+auto result = conveyor.write(data); 
+```
+
+#### 2. Error Handling via `std::expected`
+The new API returns a `std::expected` object, which either contains the result value or a strongly-typed `std::error_code`, eliminating the need to check for -1 and read the global `errno`.
+
+```cpp
+auto result = conveyor.write(data);
+if (!result) {
+    // result.error() contains the std::error_code
+    std::cerr << "Write failed: " << result.error().message() << "\n";
+}
+```
+
+#### 3. Automatic Resource Management (RAII)
+The `Conveyor` class wraps the raw C-style pointer in a `std::unique_ptr` with a custom deleter. The destructor automatically calls `conveyor_destroy`, which in turn flushes any pending writes. This prevents resource leaks and data loss from forgetting to clean up.
+
+### Modern Usage Example
+
+```cpp
+#include "libconveyor/conveyor_modern.hpp"
+#include <iostream>
+#include <vector>
+
+// Dummy storage operations for the example
+ssize_t my_pwrite(storage_handle_t, const void*, size_t count, off_t) { return count; }
+ssize_t my_pread(storage_handle_t, void*, size_t count, off_t) { return count; }
+off_t my_lseek(storage_handle_t, off_t offset, int) { return offset; }
+
+void modern_usage_example() {
+    storage_operations_t ops = { my_pwrite, my_pread, my_lseek };
+    
+    // 1. Create with designated initializers (C++20 feature)
+    auto result = libconveyor::v2::Conveyor::create({
+        .handle = nullptr, // Using a dummy handle for this example
+        .ops = ops,
+        .write_capacity = 5 * 1024 * 1024
+    });
+
+    if (!result) {
+        std::cerr << "Failed to init: " << result.error().message() << std::endl;
+        return;
+    }
+
+    // Move ownership to local variable
+    auto conveyor = std::move(result.value());
+
+    // 2. Write using a std::vector (no size param needed)
+    std::vector<int> numbers = {1, 2, 3, 4, 5};
+    
+    // The .and_then() chain allows functional-style error handling (C++23)
+    conveyor.write(numbers)
+        .and_then([&](size_t written) -> std::expected<void, std::error_code> {
+            std::cout << "Wrote " << written << " bytes\n";
+            return conveyor.flush();
+        })
+        .or_else([](std::error_code e) -> std::expected<void, std::error_code> {
+            std::cerr << "IO Error: " << e.message() << "\n";
+            return std::unexpected(e);
+        });
+
+    // 3. Stats with strong types
+    auto stats = conveyor.stats();
+    std::cout << "Avg Latency: " << stats.avg_write_latency.count() << "ms\n";
+
+} // Destructor for 'conveyor' runs here -> Flushes remaining data -> Destroys threads
+```
+
+## Contributing
+
+
+Contributions are welcome! Please ensure that any new features or bug fixes include corresponding test cases and maintain the existing coding style.
+
+## License
+
+`libconveyor` is distributed under the **BSD 3-Clause License**. See the [LICENSE.md](./LICENSE.md) file for full details.
