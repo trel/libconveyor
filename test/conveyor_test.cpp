@@ -332,6 +332,65 @@ void test_lseek_invalidation() {
 }
 
 
+static std::atomic<int> g_pwrite_successful_writes_counter(0);
+static int g_pwrite_fail_after_n = 0;
+
+static ssize_t mock_pwrite_fail_after_n_writes(storage_handle_t handle, const void* buf, size_t count, off_t offset) {
+    if (g_pwrite_fail_after_n > 0 && g_pwrite_successful_writes_counter.load() >= g_pwrite_fail_after_n) {
+        errno = EIO; // Simulate I/O error
+        return LIBCONVEYOR_ERROR;
+    }
+    g_pwrite_successful_writes_counter++;
+    return mock_pwrite(handle, buf, count, offset);
+}
+
+void test_sticky_error_propagation() {
+    reset_mock_storage();
+    g_pwrite_successful_writes_counter = 0;
+    g_pwrite_fail_after_n = 5; // Fail after 5 successful writes
+
+    storage_operations_t mock_ops = {mock_pwrite_fail_after_n_writes, mock_pread, mock_lseek};
+    conveyor_t* conv = conveyor_create(1, O_WRONLY, &mock_ops, 1024, 0);
+    TEST_ASSERT(conv != nullptr, "conveyor_create returned nullptr");
+    
+    std::string test_data = "ABCDE"; // 5 bytes
+
+    // Perform 5 successful writes
+    for (int i = 0; i < 5; ++i) {
+        ssize_t bytes_written = conveyor_write(conv, test_data.c_str(), test_data.length());
+        TEST_ASSERT(bytes_written == (ssize_t)test_data.length(), "Write " + std::to_string(i+1) + " should succeed");
+    }
+
+    // The 6th write will fail asynchronously in the background
+    ssize_t bytes_written_6th = conveyor_write(conv, test_data.c_str(), test_data.length());
+    TEST_ASSERT(bytes_written_6th == (ssize_t)test_data.length(), "6th write should be enqueued successfully");
+
+    // Perform subsequent writes (7th, 8th). These should also be enqueued
+    ssize_t bytes_written_7th = conveyor_write(conv, test_data.c_str(), test_data.length());
+    TEST_ASSERT(bytes_written_7th == (ssize_t)test_data.length(), "7th write should be enqueued successfully");
+    ssize_t bytes_written_8th = conveyor_write(conv, test_data.c_str(), test_data.length());
+    TEST_ASSERT(bytes_written_8th == (ssize_t)test_data.length(), "8th write should be enqueued successfully");
+
+    // Flush the conveyor, expect it to return error due to the 6th write's failure
+    int flush_result = conveyor_flush(conv);
+    TEST_ASSERT(flush_result == LIBCONVEYOR_ERROR, "conveyor_flush should return an error");
+    TEST_ASSERT(errno == EIO, "errno should be EIO after flush");
+
+    // Verify that the library enters a "safe state"
+    errno = 0; // Clear errno
+    ssize_t bytes_written_after_failure = conveyor_write(conv, test_data.c_str(), test_data.length());
+    TEST_ASSERT(bytes_written_after_failure == LIBCONVEYOR_ERROR, "Write after failure should immediately return error");
+    TEST_ASSERT(errno == EIO, "errno should still be EIO for subsequent writes");
+
+    // Verify stats
+    conveyor_stats_t stats;
+    conveyor_get_stats(conv, &stats);
+    TEST_ASSERT(stats.last_error_code == EIO, "last_error_code in stats should be EIO");
+
+    conveyor_destroy(conv);
+}
+
+
 int main(int argc, char **argv) {
     test_create_destroy();
     test_write_and_flush();
@@ -342,6 +401,7 @@ int main(int argc, char **argv) {
     test_read_sees_unflushed_write();
     test_slow_backend_saturation();
     test_lseek_invalidation();
+    test_sticky_error_propagation();
 
     if (g_test_failed) {
         std::cerr << "!!! One or more tests FAILED !!!" << std::endl;
