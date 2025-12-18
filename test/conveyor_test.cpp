@@ -391,6 +391,39 @@ void test_sticky_error_propagation() {
 }
 
 
+static std::promise<void> g_pread_block_promise;
+static std::future<void> g_pread_block_future;
+
+static ssize_t mock_pread_block(storage_handle_t, void* buf, size_t count, off_t offset) {
+    g_pread_block_future.wait(); // This will block until the promise is set
+    return mock_pread(0, buf, count, offset); // Delegate to original mock pread after unblocking
+}
+
+void test_destructor_teardown_race() {
+    for (int i = 0; i < 10000; ++i) {
+        reset_mock_storage();
+        g_pread_block_promise = std::promise<void>();
+        g_pread_block_future = g_pread_block_promise.get_future();
+        storage_operations_t mock_ops = {mock_pwrite, mock_pread_block, mock_lseek};
+
+        conveyor_t* conv = conveyor_create(1, O_RDONLY, &mock_ops, 0, 4096);
+        TEST_ASSERT(conv != nullptr, "conveyor_create returned nullptr");
+
+        std::thread read_thread([&]() {
+            char read_buf[10];
+            conveyor_read(conv, read_buf, 10);
+        });
+
+        // Unblock the pread so the worker thread can finish
+        g_pread_block_promise.set_value();
+        
+        // Immediately destroy the conveyor
+        conveyor_destroy(conv);
+        read_thread.join();
+    }
+}
+
+
 int main(int argc, char **argv) {
     test_create_destroy();
     test_write_and_flush();
@@ -402,6 +435,7 @@ int main(int argc, char **argv) {
     test_slow_backend_saturation();
     test_lseek_invalidation();
     test_sticky_error_propagation();
+    test_destructor_teardown_race();
 
     if (g_test_failed) {
         std::cerr << "!!! One or more tests FAILED !!!" << std::endl;
