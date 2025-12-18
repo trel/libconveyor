@@ -53,14 +53,30 @@ struct RingBuffer { // Still needed for read buffer
         if (len == 0) return 0;
         size_t bytes_to_read = std::min(len, size);
         if (bytes_to_read == 0) return 0;
-        size_t first_chunk_len = std::min(bytes_to_read, capacity - tail);
-        std::memcpy(data, buffer.data() + tail, first_chunk_len);
-        if (bytes_to_read > first_chunk_len) {
-            std::memcpy(data + first_chunk_len, buffer.data(), bytes_to_read - first_chunk_len);
+        
+        if (data != nullptr) {
+            size_t first_chunk_len = std::min(bytes_to_read, capacity - tail);
+            std::memcpy(data, buffer.data() + tail, first_chunk_len);
+            if (bytes_to_read > first_chunk_len) {
+                std::memcpy(data + first_chunk_len, buffer.data(), bytes_to_read - first_chunk_len);
+            }
         }
+        
         tail = (tail + bytes_to_read) % capacity;
         size -= bytes_to_read;
         return bytes_to_read;
+    }
+
+    // Helper to peek at data without advancing 'tail' (for snooping)
+    // Returns bytes copied.
+    size_t peek_at(size_t absolute_ring_pos, char* dest, size_t len) const {
+        size_t offset = absolute_ring_pos % capacity;
+        size_t first_chunk = std::min(len, capacity - offset);
+        std::memcpy(dest, buffer.data() + offset, first_chunk);
+        if (len > first_chunk) {
+            std::memcpy(dest + first_chunk, buffer.data(), len - first_chunk);
+        }
+        return len;
     }
 
     void clear() { size = 0; head = 0; tail = 0; }

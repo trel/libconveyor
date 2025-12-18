@@ -9,19 +9,9 @@
 #include <BaseTsd.h> // For SSIZE_T
 #include <io.h>     // For _lseek, _read, _write
 #include <fcntl.h>  // For _O_RDONLY, _O_WRONLY, _O_RDWR, _O_APPEND, _O_CREAT, _O_TRUNC
-#define O_RDONLY _O_RDONLY
-#define O_WRONLY _O_WRONLY
-#define O_RDWR   _O_RDWR
-#define O_APPEND _O_APPEND
-#define O_CREAT  _O_CREAT
-#define O_TRUNC  _O_TRUNC
-#define S_IREAD  _S_IREAD
-#define S_IWRITE _S_IWRITE
-// Define O_ACCMODE for Windows if not present
-#ifndef O_ACCMODE
-#define O_ACCMODE (O_RDONLY | O_WRONLY | O_RDWR)
+#ifndef off_t
+#define off_t __int64
 #endif
-typedef long off_t;
 typedef int ssize_t; // Windows doesn't have ssize_t, use int for signed size
 #else
 #include <sys/types.h> // For off_t, ssize_t on POSIX systems

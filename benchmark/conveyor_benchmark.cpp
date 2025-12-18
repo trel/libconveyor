@@ -3,8 +3,8 @@
 #include <vector>
 #include <chrono>
 #include <thread>
-#include <numeric>   // For std::accumulate
-#include <algorithm> // For std::sort
+#include <numeric>   
+#include <algorithm> 
 #include <cstring>
 #include <cmath>
 #include <fcntl.h>
@@ -13,45 +13,64 @@
 #include <io.h>
 #include <windows.h>
 
-// POSIX pwrite/pread are not available on Windows, so we emulate them
+// --- FIX 1: Thread-Safe Atomic I/O for Windows ---
+// Uses WriteFile/ReadFile with OVERLAPPED to avoid changing the global file pointer.
 ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset) {
-    long original_pos = _lseek(fd, 0, SEEK_CUR);
-    if (original_pos == -1) return -1;
-    if (_lseek(fd, offset, SEEK_SET) == -1) return -1;
-    ssize_t bytes_written = _write(fd, buf, count);
-    _lseek(fd, original_pos, SEEK_SET);
-    return bytes_written;
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    if (hFile == INVALID_HANDLE_VALUE) return -1;
+
+    OVERLAPPED ov = { 0 };
+    ov.Offset = offset & 0xFFFFFFFF;
+    ov.OffsetHigh = (offset >> 32) & 0xFFFFFFFF;
+
+    DWORD bytesWritten = 0;
+    if (!WriteFile(hFile, buf, (DWORD)count, &bytesWritten, &ov)) {
+        return -1;
+    }
+    return (ssize_t)bytesWritten;
 }
 
 ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
-    long original_pos = _lseek(fd, 0, SEEK_CUR);
-    if (original_pos == -1) return -1;
-    if (_lseek(fd, offset, SEEK_SET) == -1) return -1;
-    ssize_t bytes_read = _read(fd, buf, count);
-    _lseek(fd, original_pos, SEEK_SET);
-    return bytes_read;
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    if (hFile == INVALID_HANDLE_VALUE) return -1;
+
+    OVERLAPPED ov = { 0 };
+    ov.Offset = offset & 0xFFFFFFFF;
+    ov.OffsetHigh = (offset >> 32) & 0xFFFFFFFF;
+
+    DWORD bytesRead = 0;
+    if (!ReadFile(hFile, buf, (DWORD)count, &bytesRead, &ov)) {
+        return -1;
+    }
+    return (ssize_t)bytesRead;
 }
 
-// Map other functions and macros
+// Map MSVC functions
 #define open _open
 #define close _close
 #define lseek _lseek
 #define ftruncate _chsize
 #define unlink _unlink
+
+// Map Flags
 #define O_RDWR _O_RDWR
 #define O_CREAT _O_CREAT
 #define O_TRUNC _O_TRUNC
-#define S_IREAD _S_IREAD
-#define S_IWRITE _S_IWRITE
+// --- FIX 2: Binary Mode is Mandatory on Windows ---
+#define O_BINARY _O_BINARY 
+
+#else
+// Linux/macOS standard includes
+#include <unistd.h>
+#include <sys/stat.h>
+#define O_BINARY 0 // No-op on POSIX
 #endif
 
-
-
 // --- Configuration ---
-const size_t BLOCK_SIZE = 4096;        // 4KB blocks
+const size_t BLOCK_SIZE = 4096;        
 const size_t TOTAL_DATA = 10 * 1024 * 1024; // 10 MB total
 const size_t NUM_OPS = TOTAL_DATA / BLOCK_SIZE;
-const int SIMULATED_LATENCY_US = 2000; // 2ms latency per IO (Network drive simulation)
+const int SIMULATED_LATENCY_US = 2000; 
 
 // --- Helper: Statistics ---
 struct Result {
@@ -88,23 +107,30 @@ void print_result(const std::string& name, const Result& r) {
 }
 
 // --- Slow Storage Wrapper ---
-// Wraps real POSIX calls but adds artificial delay to simulate network/disk load
 ssize_t slow_pwrite(storage_handle_t fd, const void* buf, size_t count, off_t offset) {
     if (SIMULATED_LATENCY_US > 0) {
         std::this_thread::sleep_for(std::chrono::microseconds(SIMULATED_LATENCY_US));
     }
+#ifdef _MSC_VER
+    return pwrite((int)(intptr_t)fd, buf, count, offset);
+#else
     return ::pwrite((int)(intptr_t)fd, buf, count, offset);
+#endif
 }
 
 ssize_t slow_pread(storage_handle_t fd, void* buf, size_t count, off_t offset) {
     if (SIMULATED_LATENCY_US > 0) {
         std::this_thread::sleep_for(std::chrono::microseconds(SIMULATED_LATENCY_US));
     }
+#ifdef _MSC_VER
+    return pread((int)(intptr_t)fd, buf, count, offset);
+#else
     return ::pread((int)(intptr_t)fd, buf, count, offset);
+#endif
 }
 
 off_t slow_lseek(storage_handle_t fd, off_t offset, int whence) {
-    return ::lseek((int)(intptr_t)fd, offset, whence);
+    return lseek((int)(intptr_t)fd, offset, whence);
 }
 
 // --- Benchmarks ---
@@ -133,7 +159,7 @@ Result run_raw_write_benchmark(int fd, const std::vector<char>& data) {
 Result run_conveyor_write_benchmark(int fd, const std::vector<char>& data) {
     storage_operations_t ops = { slow_pwrite, slow_pread, slow_lseek };
     
-    // Create conveyor with 5MB buffers (enough to hold half the test in RAM)
+    // Create conveyor with 5MB buffers
     conveyor_t* conv = conveyor_create((storage_handle_t)(intptr_t)fd, O_RDWR, &ops, 5 * 1024 * 1024, 1024 * 1024);
     
     std::vector<double> latencies;
@@ -144,23 +170,19 @@ Result run_conveyor_write_benchmark(int fd, const std::vector<char>& data) {
     for (size_t i = 0; i < NUM_OPS; ++i) {
         auto start_op = std::chrono::high_resolution_clock::now();
         
-        // This should return INSTANTLY because it hits the buffer
         ssize_t res = conveyor_write(conv, data.data(), BLOCK_SIZE);
         if (res < 0) {
             std::cerr << "Conveyor write failed! errno=" << errno << std::endl;
             exit(1);
         }
 
-        // Simulate other work happening in the application
+        // Simulate application work
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
         auto end_op = std::chrono::high_resolution_clock::now();
         latencies.push_back(std::chrono::duration<double, std::micro>(end_op - start_op).count());
     }
     
-    // We do NOT include flush time in latency stats because the application
-    // perceives the write as "done". However, we must flush before destroying
-    // to ensure correctness.
     conveyor_flush(conv); 
 
     auto end_total = std::chrono::high_resolution_clock::now();
@@ -178,32 +200,26 @@ int main() {
 
     std::vector<char> data(BLOCK_SIZE, 'X');
     
-    // Create a temp file
-    int fd = open("benchmark_temp.dat", O_RDWR | O_CREAT | O_TRUNC, 0666);
+    // Add O_BINARY to prevent CRLF translation corruption
+    int fd = open("benchmark_temp.dat", O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0666);
     if (fd < 0) { perror("open"); return 1; }
 
-    // --- Run RAW ---
     std::cout << "Running Raw POSIX Benchmark (Blocking)...\n";
     Result raw_res = run_raw_write_benchmark(fd, data);
     print_result("Raw POSIX Write", raw_res);
 
-    // Reset file
     ftruncate(fd, 0);
     lseek(fd, 0, SEEK_SET);
 
-    // --- Run CONVEYOR ---
     std::cout << "Running libconveyor Benchmark (Async)...\n";
     Result conv_res = run_conveyor_write_benchmark(fd, data);
     print_result("libconveyor Write", conv_res);
 
-    // --- Cleanup ---
     close(fd);
     unlink("benchmark_temp.dat");
     
-    // --- Summary ---
     double speedup = conv_res.throughput_mbs / raw_res.throughput_mbs;
-    std::cout << ">>> SPEEDUP FACTOR: " << speedup << "x <<<\n";
-    std::cout << "(Note: Higher speedup means the application was blocked less often)\n";
+    std::cout << ">>> SPEEDUP FACTOR: " << speedup << "x <<<" << "\n";
 
     return 0;
 }
