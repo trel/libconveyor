@@ -391,6 +391,77 @@ void test_sticky_error_propagation() {
 }
 
 
+void test_write_larger_than_buffer() {
+    reset_mock_storage();
+    storage_operations_t mock_ops = {mock_pwrite, mock_pread, mock_lseek};
+    
+    conveyor_t* conv = conveyor_create(1, O_WRONLY, &mock_ops, 100, 0); // 100 byte buffer
+    TEST_ASSERT(conv != nullptr, "conveyor_create returned nullptr");
+
+    std::string large_data(200, 'X'); // 200 bytes
+    ssize_t bytes_written = conveyor_write(conv, large_data.c_str(), large_data.length());
+
+    TEST_ASSERT(bytes_written == LIBCONVEYOR_ERROR, "Write larger than buffer should fail");
+    TEST_ASSERT(errno == EMSGSIZE, "errno should be EMSGSIZE for write larger than buffer");
+
+    conveyor_destroy(conv);
+}
+
+void test_o_append_mode() {
+    reset_mock_storage();
+    storage_operations_t mock_ops = {mock_pwrite, mock_pread, mock_lseek};
+    
+    // Write some initial data to the mock storage
+    std::string initial_data = "Initial data. ";
+    mock_pwrite(1, initial_data.c_str(), initial_data.length(), 0);
+
+    conveyor_t* conv = conveyor_create(1, O_WRONLY | O_APPEND, &mock_ops, 1024, 0);
+    TEST_ASSERT(conv != nullptr, "conveyor_create returned nullptr for O_APPEND");
+
+    std::string append_data1 = "Appended data 1. ";
+    conveyor_write(conv, append_data1.c_str(), append_data1.length());
+
+    std::string append_data2 = "Appended data 2.";
+    conveyor_write(conv, append_data2.c_str(), append_data2.length());
+
+    conveyor_flush(conv);
+    conveyor_destroy(conv);
+
+    std::string expected_data = initial_data + append_data1 + append_data2;
+    TEST_ASSERT(g_mock_storage_data.size() == expected_data.length(), "O_APPEND: Mock storage size mismatch");
+    TEST_ASSERT(std::string(g_mock_storage_data.data(), g_mock_storage_data.size()) == expected_data, "O_APPEND: Data mismatch in mock storage");
+}
+
+void test_clear_error() {
+    reset_mock_storage();
+    g_pwrite_fail_once_counter = 0;
+    storage_operations_t mock_ops = {mock_pwrite_fail_once, mock_pread, mock_lseek};
+    conveyor_t* conv = conveyor_create(1, O_WRONLY, &mock_ops, 1024, 0);
+    TEST_ASSERT(conv != nullptr, "conveyor_create returned nullptr");
+
+    std::string test_data = "some data";
+    
+    // This first write will fail and set the sticky error
+    ssize_t bytes_written_fail = conveyor_write(conv, test_data.c_str(), test_data.length());
+    // This write may or may not fail immediately depending on whether the worker has run. 
+    // We need to flush to be sure the error is propagated.
+    conveyor_flush(conv);
+
+    ssize_t bytes_written_after_fail = conveyor_write(conv, test_data.c_str(), test_data.length());
+    TEST_ASSERT(bytes_written_after_fail == LIBCONVEYOR_ERROR, "Write after failure should fail");
+    TEST_ASSERT(errno == EIO, "errno should be EIO after failure");
+
+    // Clear the error
+    int clear_result = conveyor_clear_error(conv);
+    TEST_ASSERT(clear_result == 0, "conveyor_clear_error should succeed");
+
+    // This write should now succeed
+    ssize_t bytes_written_after_clear = conveyor_write(conv, test_data.c_str(), test_data.length());
+    TEST_ASSERT(bytes_written_after_clear == (ssize_t)test_data.length(), "Write after clear should succeed");
+
+    conveyor_destroy(conv);
+}
+
 static std::promise<void> g_pread_block_promise;
 static std::future<void> g_pread_block_future;
 
@@ -439,10 +510,13 @@ int main(int argc, char **argv) {
     test_fast_write_hiding();
     test_fast_read_hiding();
     test_zero_byte_operations();
+    test_write_larger_than_buffer();
     test_read_sees_unflushed_write();
     test_slow_backend_saturation();
     test_lseek_invalidation();
+    test_o_append_mode();
     test_sticky_error_propagation();
+    test_clear_error();
     test_destructor_teardown_race();
 
     if (g_test_failed) {
