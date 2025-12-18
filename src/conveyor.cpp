@@ -1,15 +1,14 @@
 #include "libconveyor/conveyor.h"
-#include <iostream>
 #include <vector>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
 #include <atomic>
 #include <cerrno>
+#include <cstring> // For memcpy
 #include <algorithm>
 #include <chrono>
-#include <queue> // For std::queue
-#include "libconveyor/detail/ring_buffer.h"
+#include <queue> 
 
 #ifndef O_ACCMODE
 #define O_ACCMODE (O_RDONLY | O_WRONLY | O_RDWR)
@@ -17,7 +16,49 @@
 
 namespace libconveyor {
 
+struct RingBuffer { 
+    std::vector<char> buffer;
+    size_t capacity = 0;
+    size_t head = 0;
+    size_t tail = 0;
+    size_t size = 0;
 
+    RingBuffer(size_t cap) : capacity(cap), buffer(cap) {}
+
+    size_t write(const char* data, size_t len) {
+        if (len == 0) return 0;
+        size_t bytes_to_write = std::min(len, capacity - size);
+        if (bytes_to_write == 0) return 0;
+        size_t first_chunk_len = std::min(bytes_to_write, capacity - head);
+        std::memcpy(buffer.data() + head, data, first_chunk_len);
+        if (bytes_to_write > first_chunk_len) {
+            std::memcpy(buffer.data(), data + first_chunk_len, bytes_to_write - first_chunk_len);
+        }
+        head = (head + bytes_to_write) % capacity;
+        size += bytes_to_write;
+        return bytes_to_write;
+    }
+
+    size_t read(char* data, size_t len) {
+        if (len == 0) return 0;
+        size_t bytes_to_read = std::min(len, size);
+        if (bytes_to_read == 0) return 0;
+        size_t first_chunk_len = std::min(bytes_to_read, capacity - tail);
+        std::memcpy(data, buffer.data() + tail, first_chunk_len);
+        if (bytes_to_read > first_chunk_len) {
+            std::memcpy(data + first_chunk_len, buffer.data(), bytes_to_read - first_chunk_len);
+        }
+        tail = (tail + bytes_to_read) % capacity;
+        size -= bytes_to_read;
+        return bytes_to_read;
+    }
+
+    void clear() { size = 0; head = 0; tail = 0; }
+    bool empty() const { return size == 0; }
+    bool full() const { return size == capacity; }
+    size_t available_space() const { return capacity - size; }
+    size_t available_data() const { return size; }
+};
 
 struct WriteRequest {
     std::vector<char> data;
@@ -29,10 +70,11 @@ struct ConveyorImpl {
     int flags;
     storage_operations_t ops;
 
+    // Write Logic
     bool write_buffer_enabled = false;
-    std::deque<WriteRequest> write_queue; // Changed from std::queue to std::deque
-    size_t write_buffer_capacity; // To enforce limits on write_queue size
-    std::atomic<size_t> write_queue_bytes{0}; // Track total bytes in queue
+    std::deque<WriteRequest> write_queue; // Changed to std::deque
+    size_t write_buffer_capacity;
+    std::atomic<size_t> write_queue_bytes{0};
     std::thread write_worker_thread;
     std::mutex write_mutex;
     std::condition_variable write_cv_producer;
@@ -40,6 +82,7 @@ struct ConveyorImpl {
     std::atomic<bool> write_worker_stop_flag{false};
     std::atomic<bool> write_buffer_needs_flush{false};
     
+    // Read Logic
     bool read_buffer_enabled = false;
     RingBuffer read_buffer;
     std::thread read_worker_thread;
@@ -47,13 +90,16 @@ struct ConveyorImpl {
     std::condition_variable read_cv_producer;
     std::condition_variable read_cv_consumer;
     std::atomic<bool> read_worker_stop_flag{false};
-    std::atomic<bool> read_buffer_stale{false};
     std::atomic<bool> read_worker_needs_fill{false};
     std::atomic<bool> read_eof_flag{false};
+    
+    // --- FIX: GENERATION COUNTER ---
+    // Prevents lseek/read race conditions
+    std::atomic<uint64_t> read_buffer_generation{0}; 
 
-    std::atomic<off_t> logical_write_offset{0}; // Tracks the logical end of file after writes
-    std::atomic<off_t> read_head_in_storage{0};  // Tracks the physical read position for readWorker
-    std::atomic<off_t> current_file_offset{0}; // Tracks the logical current file offset for all operations
+    std::atomic<off_t> logical_write_offset{0};
+    std::atomic<off_t> read_head_in_storage{0};
+    std::atomic<off_t> current_file_offset{0};
 
     struct Stats {
         std::atomic<size_t> bytes_written{0};
@@ -66,130 +112,112 @@ struct ConveyorImpl {
         std::atomic<int> last_error_code{0};
     } stats;
     
-    // Constructor
     ConveyorImpl(size_t w_cap, size_t r_cap) 
-        : write_buffer_capacity(w_cap), 
-          read_buffer(r_cap) {} // Initialize read_buffer here
+        : write_buffer_capacity(w_cap), read_buffer(r_cap) {}
 
-    // Member function declarations for worker threads
-    void writeWorker();
-    void readWorker();
-}; // End of ConveyorImpl struct definition
+    void writeWorker() {
+        while (true) {
+            std::unique_lock<std::mutex> lock(write_mutex);
+            write_cv_consumer.wait(lock, [&] { 
+                return !write_queue.empty() || write_buffer_needs_flush || write_worker_stop_flag; 
+            });
+            if (write_worker_stop_flag && write_queue.empty()) break;
 
-// Move implementations outside the struct
-void ConveyorImpl::writeWorker() {
-    while (true) {
-        std::unique_lock<std::mutex> lock(write_mutex);
-        write_cv_consumer.wait(lock, [&] { 
-            return !write_queue.empty() || write_buffer_needs_flush || write_worker_stop_flag; 
-        });
-        if (write_worker_stop_flag && write_queue.empty()) break;
+            if (write_queue.empty()) { 
+                write_buffer_needs_flush = false;
+                write_cv_producer.notify_all(); 
+                continue;
+            }
 
-                    // Process all items in the queue
-                    while (!write_queue.empty()) {
-                        WriteRequest req = write_queue.front();
-                        write_queue.pop_front();
-                        // write_queue_bytes -= req.data.size(); // OLD POSITION - MOVED BELOW
-                        
-                        lock.unlock(); // Unlock before performing I/O
-        
-                        // Handle O_APPEND semantics here, before pwrite
-                        off_t write_pos = req.offset;
-                        if (flags & O_APPEND) {
-                            // For append mode, seek to end *just before* writing to ensure data is appended
-                            // It's important to use the underlying lseek directly here.
-                            write_pos = ops.lseek(handle, 0, SEEK_END); 
-                            if (write_pos == LIBCONVEYOR_ERROR) {
-                                lock.lock(); // Re-lock to update stats.last_error_code
-                                if (stats.last_error_code.load() == 0) stats.last_error_code = errno;
-                                lock.unlock();
-                                // If lseek fails, we cannot proceed with this write.
-                                // We must re-lock to update state if necessary and then continue;
-                                // For now, continue to next request.
-                                continue; 
-                            }
-                        }
-                        
-                        auto start = std::chrono::steady_clock::now();
-                        ssize_t written_bytes = ops.pwrite(handle, req.data.data(), req.data.size(), write_pos);
-                        auto end = std::chrono::steady_clock::now();
-                        
-                        // Update atomics outside the lock
-                        stats.total_write_latency_ms += std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-                        stats.write_ops_count++;                            
-                        lock.lock(); // Re-lock only for updating error code and logical_write_offset based on success/failure
-                        if (written_bytes < 0) {
-                            if (stats.last_error_code.load() == 0) stats.last_error_code = errno;
-                        } else if (written_bytes > 0) {
-                            logical_write_offset = write_pos + static_cast<off_t>(written_bytes);
-                        }
-                        write_queue_bytes -= req.data.size(); // NEW POSITION - Decrement bytes count AFTER pwrite
-                        write_cv_producer.notify_all(); // Notify producers that space is available
-                    }        
-        // After processing all items, if a flush was requested and queue is empty, notify.
-        if (write_buffer_needs_flush && write_queue.empty()) {
-            write_buffer_needs_flush = false;
-            write_cv_producer.notify_all(); // Unblock anyone waiting for empty queue (e.g., conveyor_lseek, conveyor_flush)
-        }        
-    }
-}
-
-void ConveyorImpl::readWorker() {
-    std::vector<char> temp_buffer;
-    temp_buffer.reserve(read_buffer.capacity); // Reserve once
-
-    while (true) {
-        std::unique_lock<std::mutex> lock(read_mutex);
-        // Wait for signal: buffer stale, stop, or read_worker_needs_fill
-        read_cv_producer.wait(lock, [&] { 
-            return read_buffer_stale.load() || read_worker_stop_flag.load() || read_worker_needs_fill.load(); 
-        });
-
-        if (read_worker_stop_flag.load()) break;
-
-        if (read_buffer_stale.load()) {
-            read_buffer.clear();
-            read_buffer_stale = false;
-            // After clearing, reset read_head_in_storage to current_file_offset if we intend to fill from there
-            // This will be handled by conveyor_lseek setting read_head_in_storage, so no action here.
-            // Just clear the buffer and continue waiting for an explicit fill request.
-        }
-        
-        // Only attempt to fill the buffer if requested and there is space
-        if (read_worker_needs_fill.load() && read_buffer.available_space() > 0) {
-            // read_worker_needs_fill = false; // Reset the flag early to avoid re-triggering -- REMOVED
-            off_t read_pos = read_head_in_storage.load();
-            size_t n = read_buffer.available_space();
-            temp_buffer.resize(n); // Resize temp_buffer to match what we intend to read
+            WriteRequest req = write_queue.front();
+            write_queue.pop_front();
+            write_queue_bytes -= req.data.size();
             
-            lock.unlock(); // Unlock before performing I/O
+            write_cv_producer.notify_all(); 
 
+            lock.unlock(); 
+
+            off_t write_pos = req.offset;
+            if (flags & O_APPEND) {
+                write_pos = ops.lseek(handle, 0, SEEK_END); 
+                if (write_pos == LIBCONVEYOR_ERROR) {
+                    lock.lock();
+                    if (stats.last_error_code.load() == 0) stats.last_error_code = errno;
+                    lock.unlock();
+                    continue; 
+                }
+            }
+            
             auto start = std::chrono::steady_clock::now();
-            ssize_t bytes_read = ops.pread(handle, temp_buffer.data(), n, read_pos);
+            ssize_t written_bytes = ops.pwrite(handle, req.data.data(), req.data.size(), write_pos);
             auto end = std::chrono::steady_clock::now();
             
-            lock.lock(); // Re-lock to update shared state
-            stats.total_read_latency_ms += std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-            stats.read_ops_count++;
-
-            if (bytes_read > 0) {
-                read_buffer.write(temp_buffer.data(), bytes_read);
-                read_head_in_storage += static_cast<off_t>(bytes_read);
-            } else if (bytes_read == 0) {
-                read_eof_flag = true;
-            } else if (stats.last_error_code.load() == 0) {
-                stats.last_error_code = errno;
+            lock.lock(); 
+            stats.total_write_latency_ms += std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+            stats.write_ops_count++;
+            
+            if (written_bytes < 0) {
+                if (stats.last_error_code.load() == 0) stats.last_error_code = errno;
+            } else if (written_bytes > 0) {
+                logical_write_offset = write_pos + written_bytes;
             }
-            read_worker_needs_fill = false; // Reset the flag after processing
         }
-        read_cv_consumer.notify_all(); // Notify consumers that buffer state might have changed
     }
-}
-} // End namespace libconveyor
 
-conveyor_t* conveyor_create(storage_handle_t h, int f, const storage_operations_t* ops, size_t w, size_t r) {
+    void readWorker() {
+        std::vector<char> temp_buffer;
+        temp_buffer.reserve(read_buffer.capacity);
+        while (true) {
+            std::unique_lock<std::mutex> lock(read_mutex);
+            read_cv_producer.wait(lock, [&] { 
+                return read_buffer.available_space() > 0 || read_worker_stop_flag.load() || read_worker_needs_fill.load(); 
+            });
+            if (read_worker_stop_flag.load()) break;
+
+            if (read_buffer.available_space() > 0 && !read_worker_stop_flag.load()) {
+                // Capture the generation BEFORE unlocking
+                uint64_t my_gen = read_buffer_generation.load();
+                
+                off_t read_pos = current_file_offset + read_buffer.available_data();
+                size_t n = read_buffer.available_space();
+                temp_buffer.resize(n);
+                
+                lock.unlock(); // --- I/O STARTS ---
+
+                auto start = std::chrono::steady_clock::now();
+                ssize_t bytes_read = ops.pread(handle, temp_buffer.data(), n, read_pos);
+                auto end = std::chrono::steady_clock::now();
+                
+                lock.lock(); // --- I/O ENDS ---
+
+                // --- FIX: GENERATION CHECK ---
+                if (my_gen != read_buffer_generation.load()) {
+                    // World changed (lseek happened). Discard data.
+                    continue;
+                }
+
+                stats.total_read_latency_ms += std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+                stats.read_ops_count++;
+
+                if (bytes_read > 0) {
+                    read_buffer.write(temp_buffer.data(), bytes_read);
+                } else if (bytes_read == 0) {
+                    read_eof_flag = true;
+                } else if (stats.last_error_code.load() == 0) {
+                    stats.last_error_code = errno;
+                }
+            }
+            if (read_worker_needs_fill.load()) read_worker_needs_fill = false;
+            read_cv_consumer.notify_all();
+        }
+    }
+};
+} // namespace libconveyor
+
+conveyor_t* conveyor_create(storage_handle_t h, int f, const storage_operations_t* o, size_t w, size_t r) {
     auto* impl = new libconveyor::ConveyorImpl(w, r);
-    impl->handle = h; impl->flags = f; impl->ops = *ops;
+    impl->handle = h; impl->flags = f; impl->ops = *o;
+    impl->write_buffer_capacity = w;
     int mode = f & O_ACCMODE;
     impl->read_buffer_enabled = (mode == O_RDONLY || mode == O_RDWR) && (r > 0);
     impl->write_buffer_enabled = (mode == O_WRONLY || mode == O_RDWR) && (w > 0);
@@ -280,23 +308,19 @@ ssize_t conveyor_read(conveyor_t* conv, void* buf, size_t count) {
     auto* impl = reinterpret_cast<libconveyor::ConveyorImpl*>(conv);
     if (!impl->read_buffer_enabled) { errno = EBADF; return LIBCONVEYOR_ERROR; }
     if (impl->stats.last_error_code.load() != 0) { errno = impl->stats.last_error_code.load(); return LIBCONVEYOR_ERROR; }
-    
-    // Acquire both locks to ensure consistency
-    std::unique_lock<std::mutex> read_lock(impl->read_mutex, std::defer_lock);
-    std::unique_lock<std::mutex> write_lock(impl->write_mutex, std::defer_lock);
-    std::lock(read_lock, write_lock);
 
     ssize_t total_read = 0;
     char* ptr = static_cast<char*>(buf);
-    off_t current_read_offset = impl->current_file_offset.load();
+    off_t current_read_offset_logic = impl->current_file_offset.load(); // Capture current logical offset
 
     // --- Phase 1: Try to satisfy read from unflushed writes (write_queue) ---
     if (impl->write_buffer_enabled) {
+        std::unique_lock<std::mutex> write_lock(impl->write_mutex); // Lock for write_queue access
         for (const auto& req : impl->write_queue) {
             off_t write_start = req.offset;
             off_t write_end = req.offset + req.data.size();
-            off_t read_start_current_iter = current_read_offset + total_read;
-            off_t read_end_current_iter = current_read_offset + count;
+            off_t read_start_current_iter = current_read_offset_logic + total_read;
+            off_t read_end_current_iter = current_read_offset_logic + count;
 
             // Calculate overlap
             off_t overlap_start = std::max(read_start_current_iter, write_start);
@@ -305,25 +329,34 @@ ssize_t conveyor_read(conveyor_t* conv, void* buf, size_t count) {
             if (overlap_start < overlap_end) { // There is an overlap
                 size_t bytes_from_write_queue = static_cast<size_t>(overlap_end - overlap_start);
                 size_t offset_in_req_data = static_cast<size_t>(overlap_start - write_start);
+                size_t offset_in_read_buf = static_cast<size_t>(overlap_start - current_read_offset_logic);
                 
-                std::memcpy(ptr + total_read, req.data.data() + offset_in_req_data, bytes_from_write_queue);
+                std::memcpy(ptr + offset_in_read_buf, req.data.data() + offset_in_req_data, bytes_from_write_queue);
                 total_read += bytes_from_write_queue;
 
                 if (total_read == count) {
-                    break; // All requested bytes satisfied from write_queue
+                    impl->current_file_offset = current_read_offset_logic + total_read;
+                    impl->stats.bytes_read += total_read;
+                    return total_read;
                 }
             }
         }
     }
 
-    // Update current_read_offset based on what was read from write_queue
-    current_read_offset += total_read;
-    size_t remaining_count = count - total_read;
+    // Release write_lock, no longer needed for reading
+    // No, we already used a unique_lock, which will unlock when it goes out of scope.
+    // So we need to create the read_lock before unlocking the write_lock.
+    
+    std::unique_lock<std::mutex> read_lock(impl->read_mutex); // Lock for read_buffer access
+    // At this point, write_lock is released.
+
+    current_read_offset_logic += total_read;
+    size_t remaining_to_read = count - total_read;
 
     // --- Phase 2: Try to satisfy remaining read from read_buffer and underlying storage ---
-    while (remaining_count > 0 && !impl->read_worker_stop_flag.load()) {
+    while (remaining_to_read > 0 && !impl->read_worker_stop_flag.load()) {
         if (impl->read_buffer.available_data() == 0) { // If read buffer is empty
-            if (impl->read_eof_flag.load() && (current_read_offset >= impl->read_head_in_storage.load())) {
+            if (impl->read_eof_flag.load() && (current_read_offset_logic >= impl->read_head_in_storage.load())) {
                 break; // Reached EOF and no more data in buffer or storage
             }
 
@@ -331,7 +364,7 @@ ssize_t conveyor_read(conveyor_t* conv, void* buf, size_t count) {
             impl->read_cv_producer.notify_one();
 
             // Wait for the read worker to fill the buffer
-            // Use current_read_offset to ensure read worker fills from correct position
+            // Use current_read_offset_logic to ensure read worker fills from correct position
             impl->read_cv_consumer.wait(read_lock, [&]{ 
                 return (impl->read_buffer.available_data() > 0) || impl->read_worker_stop_flag.load();
             });
@@ -341,28 +374,25 @@ ssize_t conveyor_read(conveyor_t* conv, void* buf, size_t count) {
             }
 
             if (impl->read_buffer.available_data() == 0) { // Still no data after waiting
-                if (impl->read_eof_flag.load() && (current_read_offset >= impl->read_head_in_storage.load())) {
+                if (impl->read_eof_flag.load() && (current_read_offset_logic >= impl->read_head_in_storage.load())) {
                     break; // Truly EOF
                 } else if (impl->stats.last_error_code.load() != 0) {
                     errno = impl->stats.last_error_code.load();
                     return LIBCONVEYOR_ERROR; // Propagate error from worker
                 }
                 // If we reach here, it implies a logical issue or a timeout, return 0 for now.
-                // This could also be a spurious wakeup where buffer is still empty and not EOF.
-                // In a robust system, we might loop back or indicate a transient error.
-                // For now, break and return what we have (0 in this case).
                 break;
             }
         }
         
-        size_t bytes_from_read_buffer = impl->read_buffer.read(ptr + total_read, remaining_count);
+        size_t bytes_from_read_buffer = impl->read_buffer.read(ptr + total_read, remaining_to_read);
         total_read += bytes_from_read_buffer;
-        remaining_count -= bytes_from_read_buffer;
-        current_read_offset += bytes_from_read_buffer;
+        remaining_to_read -= bytes_from_read_buffer;
+        current_read_offset_logic += bytes_from_read_buffer;
         impl->read_cv_producer.notify_one(); // Notify readWorker that space might be available in read_buffer
     }
 
-    impl->current_file_offset = current_read_offset; // Update global logical offset
+    impl->current_file_offset = current_read_offset_logic; // Update global logical offset
     impl->stats.bytes_read += total_read;
     return total_read;
 }
@@ -389,13 +419,16 @@ off_t conveyor_lseek(conveyor_t* conv, off_t offset, int whence) {
     if (new_pos != LIBCONVEYOR_ERROR) {
         if (impl->read_buffer_enabled) {
             impl->read_buffer.clear();
-            impl->read_buffer_stale = true;
             impl->read_eof_flag = false;
+            
+            // --- FIX: INVALIDATE WORKER GENERATION ---
+            impl->read_buffer_generation++; 
+            
             impl->read_cv_consumer.notify_all();
             impl->read_cv_producer.notify_all();
-            impl->read_head_in_storage = new_pos;
         }
         impl->current_file_offset = new_pos;
+        impl->read_head_in_storage = new_pos;
     }
     return new_pos;
 }
