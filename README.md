@@ -86,7 +86,7 @@ void cpp17_example_usage() {
     // 2. Create (Factory)
     auto result = libconveyor::v2::Conveyor::create(cfg);
     if (!result) {
-        std::cerr << "Init failed: " << result.error().message() << std::endl;
+        std::cerr << "Init failed: " << result.error().message() << '\n';
         return;
     }
     
@@ -99,9 +99,9 @@ void cpp17_example_usage() {
     auto write_res = conveyor.write(data); 
     
     if (!write_res) {
-        std::cerr << "Write error: " << write_res.error().message() << std::endl;
+        std::cerr << "Write error: " << write_res.error().message() << '\n';
     } else {
-        std::cout << "Wrote " << write_res.value() << " bytes" << std::endl;
+        std::cout << "Wrote " << write_res.value() << " bytes\n";
     }
 
     // 4. Manual flush (optional, destructor does it too)
@@ -111,9 +111,9 @@ void cpp17_example_usage() {
     std::vector<char> read_buffer(24); // Size to match data written
     auto read_res = conveyor.read(read_buffer);
     if (!read_res) {
-        std::cerr << "Read error: " << read_res.error().message() << std::endl;
+        std::cerr << "Read error: " << read_res.error().message() << '\n';
     } else {
-        std::cout << "Read " << read_res.value() << " bytes" << std::endl;
+        std::cout << "Read " << read_res.value() << " bytes\n";
     }
 
 
@@ -328,25 +328,25 @@ int main() {
 
 ## Modern C++17 Interface (`conveyor_modern.hpp`)
 
-For modern C++ applications, `libconveyor` provides a header-only C++23 wrapper that offers enhanced safety, expressiveness, and an impossible-to-misuse API. It uses RAII, `std::expected` for error handling, and `std::span` for buffer safety, incurring zero runtime overhead.
+For modern C++ applications, `libconveyor` provides a header-only C++17 wrapper that offers enhanced safety, expressiveness, and a more portable API. It uses RAII, a custom `Result` type (mimicking `std::expected`) for error handling, and SFINAE for buffer safety, incurring zero runtime overhead.
 
 ### Key Improvements
 
-#### 1. Safety via `std::span` & Concepts
-Instead of manually passing pointers and sizes, which risks buffer overflows, the modern API uses `std::span` and a concept `ByteContiguous` that accepts `std::vector`, `std::string`, or `std::array` directly, making size mismatches impossible.
+#### 1. Safety via SFINAE & Container References
+Instead of manually passing pointers and sizes, which risks buffer overflows, the modern API uses C++17's SFINAE (Substitution Failure Is Not An Error) and generic templates to accept `std::vector`, `std::string`, or `std::array` directly, making size mismatches impossible.
 
 ```cpp
 // OLD C-style API
 // conveyor_write(c, ptr, 100); // Risk: What if ptr only has 50 bytes?
 
 // NEW C++17 API
-std::string data = "Hello C++23";
+std::string data = "Hello C++17";
 // Automatically calculates size, impossible to mismatch
 auto result = conveyor.write(data); 
 ```
 
-#### 2. Error Handling via `std::expected`
-The new API returns a `std::expected` object, which either contains the result value or a strongly-typed `std::error_code`, eliminating the need to check for -1 and read the global `errno`.
+#### 2. Error Handling via `Result<T>` (C++17 `std::variant`)
+The new API returns a custom `Result<T>` object, which internally uses `std::variant`. This object either contains the result value or a strongly-typed `std::error_code`, eliminating the need to check for -1 and read the global `errno`.
 
 ```cpp
 auto result = conveyor.write(data);
@@ -371,7 +371,7 @@ ssize_t my_pwrite(storage_handle_t, const void*, size_t count, off_t) { return c
 ssize_t my_pread(storage_handle_t, void*, size_t count, off_t) { return count; }
 off_t my_lseek(storage_handle_t, off_t offset, int) { return offset; }
 
-void cpp17_example_usage(storage_handle_t fd, storage_operations_t ops) {
+void cpp17_example_usage(storage_handle_t fd, const storage_operations_t& ops) {
     storage_operations_t ops = { my_pwrite, my_pread, my_lseek };
     
     // 1. Configure the `Config` struct
