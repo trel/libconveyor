@@ -65,3 +65,33 @@ target_include_directories(conveyor_multi_thread_test PRIVATE
 )
 
 add_test(NAME ConveyorMultiThreadTest COMMAND conveyor_multi_thread_test)
+
+add_executable(conveyor_consistency_test conveyor_consistency_test.cpp)
+
+target_link_libraries(conveyor_consistency_test PRIVATE
+    conveyor
+    gtest
+    gmock
+    gtest_main
+)
+
+target_include_directories(conveyor_consistency_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+
+add_test(NAME ConveyorConsistencyTest COMMAND conveyor_consistency_test)
+
+add_executable(conveyor_partial_io_test conveyor_partial_io_test.cpp)
+
+target_link_libraries(conveyor_partial_io_test PRIVATE
+    conveyor
+    gtest
+    gmock
+    gtest_main
+)
+
+target_include_directories(conveyor_partial_io_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+
+add_test(NAME ConveyorPartialIOTest COMMAND conveyor_partial_io_test)

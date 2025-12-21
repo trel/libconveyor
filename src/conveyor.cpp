@@ -117,7 +117,26 @@ struct ConveyorImpl {
             }
             
             auto start = std::chrono::steady_clock::now();
-            ssize_t written_bytes = ops.pwrite(handle, scratch_buffer.data(), req.length, write_pos);
+            size_t total_written = 0;
+            bool write_error = false;
+            while (total_written < req.length) {
+                ssize_t written_now = ops.pwrite(handle, scratch_buffer.data() + total_written, req.length - total_written, write_pos + total_written);
+                if (written_now < 0) {
+                    if (stats.last_error_code.load() == 0) {
+                        stats.last_error_code = errno;
+                    }
+                    write_error = true;
+                    break;
+                }
+                if (written_now == 0) {
+                    if (stats.last_error_code.load() == 0) {
+                        stats.last_error_code = EIO; 
+                    }
+                    write_error = true;
+                    break;
+                }
+                total_written += written_now;
+            }
             auto end = std::chrono::steady_clock::now();
             
             // --- IO SECTION ENDS ---
@@ -130,14 +149,12 @@ struct ConveyorImpl {
             // Notify producers that space is now officially free.
             write_cv_producer.notify_all();
             
-            stats.total_write_latency_ms += std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-            stats.write_ops_count++;
-            
-            if (written_bytes < 0) {
-                if (stats.last_error_code.load() == 0) stats.last_error_code = errno;
-            } else if (written_bytes > 0) {
+            if (!write_error) {
+                stats.total_write_latency_ms += std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+                stats.write_ops_count++;
+                
                 if (flags & O_APPEND) { 
-                    logical_write_offset += written_bytes;
+                    logical_write_offset += total_written;
                 }
             }
         }
