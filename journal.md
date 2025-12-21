@@ -1,3 +1,5 @@
+## Journal Entry: 2025-12-15 - Initial Design and Data Structures
+
 In `libconveyor`, we are using the following data structures:
 
 1.  **Read Buffer**: This is implemented using a custom struct named `libconveyor::RingBuffer`. Its underlying storage is a `std::vector<char>`. The `write` and `read` methods within this struct use `head`, `tail`, `capacity`, and `size` members along with the modulo operator to correctly implement the circular, fixed-size behavior of a **ring buffer**.
@@ -23,11 +25,12 @@ While a ring buffer *could* be implemented for writes by adding a complex layer 
 The `std::deque`'s dynamic sizing is controlled by `write_buffer_capacity` and `write_cv_producer.wait_for`, which means we still enforce a maximum memory footprint, mitigating the primary concern of unbounded growth.
 
 Therefore, for the write queue, the `std::deque<WriteRequest>` is currently a better fit due to its ability to manage individual write operations with their associated offsets, which is critical for read-after-write consistency and handling non-contiguous writes.
-### Journal Entry: Completed Read-After-Write Consistency and Ring Buffer Wrap-Around Tests
+
+## Journal Entry: 2025-12-16 - Initial Test Implementation and Fixes
 
 This entry summarizes the successful implementation and verification of the first two testing scenarios.
 
-#### **Read-After-Write Consistency Test Completion:**
+### Read-After-Write Consistency Test Completion:
 *   **Problem:** Initial attempts revealed a subtle deadlock in the `conveyor_lseek` and `conveyor_flush` functions when interacting with a slow background `writeWorker`. The `lseek`'s requirement to act as a barrier for pending writes, combined with the `writeWorker`'s slow I/O, led to indefinite blocking.
 *   **Root Cause:** A circular dependency was identified where `conveyor_flush` (called by `conveyor_lseek`) would acquire the `write_mutex` and wait for the `writeWorker` to empty the queue. Simultaneously, the `writeWorker` needed the `write_mutex` to re-acquire the lock after its slow I/O operation (before it could signal completion), leading to a deadlock.
 *   **Solution:** The `writeWorker` was refactored to update atomic statistics and file offsets *outside* the `write_mutex`'s critical section as much as possible, or by ensuring the `write_mutex` was only held for minimal durations. This allowed `writeWorker` to complete its processing and signal `conveyor_flush` without blocking on the mutex held by `conveyor_flush`.
@@ -37,7 +40,7 @@ This entry summarizes the successful implementation and verification of the firs
     *   Adjusted `writeWorker`'s state updates to prevent mutex contention with `conveyor_flush`.
 *   **Verification:** The `test_read_sees_unflushed_write` test now correctly passes, confirming that read-after-write consistency is maintained even with simulated slow writes, and without deadlocking.
 
-#### **Ring Buffer "Wrap-Around" Torture Test Completion:**
+### Ring Buffer "Wrap-Around" Torture Test Completion:
 *   **Problem:** The initial `libconveyor::RingBuffer::write` implementation did not correctly handle overwriting old data when the buffer became full.
 *   **Root Cause:** The `RingBuffer::write` method was limiting the write operation to only `available_space()`, rather than correctly advancing the `tail` and overwriting older data as is typical for a caching ring buffer. The `test_ring_buffer_wrap_around` test's `expected_data` was also slightly misaligned with the intended behavior.
 *   **Solution:** The `RingBuffer::write` method was updated to correctly implement overwriting behavior. When new data is written into a full buffer, the `tail` pointer is advanced, and older data is overwritten.
@@ -47,155 +50,123 @@ This entry summarizes the successful implementation and verification of the firs
 *   **Refactoring for Testability:** The `libconveyor::RingBuffer` struct definition was moved from `src/conveyor.cpp` to `include/libconveyor/detail/ring_buffer.h`, allowing `conveyor_test.cpp` to directly instantiate and test it while maintaining proper encapsulation.
 *   **Verification:** The `test_ring_buffer_wrap_around` test now passes, confirming the correct functionality of the `RingBuffer`'s circular logic.
 
-#### **General Improvements & Refinements:**
+### General Improvements & Refinements:
 *   **C-Linkage for `conveyor_create`:** Corrected the parameter type of `storage_operations_t` in `conveyor_create` definition to match its C-compatible declaration, resolving linker errors.
 *   **Improved Test Assertions:** Replaced `assert()` with `TEST_ASSERT()` macros across the test suite for more informative failure messages and graceful test execution.
 *   **Adjusted Performance Test Assertions:** Loosened timing constraints in `test_fast_write_hiding` and `test_fast_read_hiding` to accommodate system overheads, ensuring they pass reliably while still verifying perceived "fast" behavior.
 *   **Proactive Read-Ahead:** `conveyor_create` now proactively signals `readWorker` to fill the read buffer, ensuring `conveyor_read` operations benefit from pre-filled cache immediately.
 
-This concludes the implementation and verification for the first two testing scenarios, laying a solid foundation for `libconveyor`'s robust operation. 
- # # #   J o u r n a l   E n t r y :   A d d r e s s e d   O _ A P P E N D   A t o m i c i t y   a n d   I m p l e m e n t e d   E r r o r   C l e a r i n g  
-  
- T h i s   e n t r y   s u m m a r i z e s   t h e   r e c e n t   i m p r o v e m e n t s   t o   ` l i b c o n v e y o r ` ,   f o c u s i n g   o n   e n h a n c i n g   ` O _ A P P E N D `   b e h a v i o r   a n d   p r o v i d i n g   a   m e c h a n i s m   f o r   e r r o r   h a n d l i n g .  
-  
- # # # #   * * A d d r e s s e d   O _ A P P E N D   A t o m i c i t y   f o r   S i n g l e   ` C o n v e y o r I m p l `   I n s t a n c e s : * *  
- *       * * P r o b l e m : * *   T h e   p r e v i o u s   ` O _ A P P E N D `   i m p l e m e n t a t i o n   i n   ` w r i t e W o r k e r `   u s e d   ` o p s . l s e e k ( h a n d l e ,   0 ,   S E E K _ E N D ) `   t o   d e t e r m i n e   t h e   w r i t e   p o s i t i o n .   T h i s   a p p r o a c h ,   w h i l e   a p p e a r i n g   c o r r e c t ,   i n t r o d u c e d   a   p o t e n t i a l   a t o m i c i t y   v i o l a t i o n   i f   m u l t i p l e   w r i t e r s   ( e v e n   w i t h i n   t h e   s a m e   p r o c e s s   b u t   d i f f e r e n t   ` C o n v e y o r I m p l `   i n s t a n c e s ,   o r   e x t e r n a l   p r o c e s s e s )   w e r e   c o n c u r r e n t l y   a p p e n d i n g   t o   t h e   s a m e   f i l e .   T h e   ` l s e e k `   t o   f i n d   t h e   e n d ,   f o l l o w e d   b y   ` p w r i t e `   a t   t h a t   p o s i t i o n ,   i s   n o t   i n h e r e n t l y   a t o m i c   a t   t h e   f i l e   s y s t e m   l e v e l ,   l e a d i n g   t o   p o t e n t i a l   i n t e r l e a v i n g   o r   o v e r w r i t i n g   b y   c o n c u r r e n t   a p p e n d e r s .  
- *       * * S o l u t i o n : * *   T h e   ` C o n v e y o r I m p l `   n o w   m a n a g e s   i t s   o w n   l o g i c a l   a p p e n d   p o s i t i o n   t h r o u g h   ` s t d : : a t o m i c < o f f _ t >   l o g i c a l _ w r i t e _ o f f s e t ` .  
-         *       I n   ` c o n v e y o r _ c r e a t e ` ,   i f   ` O _ A P P E N D `   i s   s e t ,   ` l o g i c a l _ w r i t e _ o f f s e t `   ( a n d   ` c u r r e n t _ f i l e _ o f f s e t ` )   i s   i n i t i a l i z e d   b y   c a l l i n g   ` o p s . l s e e k ( h a n d l e ,   0 ,   S E E K _ E N D ) `   * o n c e *   t o   e s t a b l i s h   t h e   i n i t i a l   e n d   o f   t h e   f i l e .  
-         *       I n   ` w r i t e W o r k e r ` ,   w h e n   ` O _ A P P E N D `   i s   a c t i v e ,   ` l o g i c a l _ w r i t e _ o f f s e t . l o a d ( ) `   i s   u s e d   a s   t h e   ` w r i t e _ p o s `   f o r   ` o p s . p w r i t e `   i n s t e a d   o f   r e - q u e r y i n g   ` o p s . l s e e k ( h a n d l e ,   0 ,   S E E K _ E N D ) ` .  
-         *       A f t e r   a   s u c c e s s f u l   ` o p s . p w r i t e `   i n   ` O _ A P P E N D `   m o d e ,   ` l o g i c a l _ w r i t e _ o f f s e t `   i s   a t o m i c a l l y   i n c r e m e n t e d   b y   t h e   ` w r i t t e n _ b y t e s ` .  
- *       * * V e r i f i c a t i o n : * *   T h i s   c h a n g e   e n s u r e s   t h a t   a l l   ` O _ A P P E N D `   o p e r a t i o n s   o r i g i n a t i n g   f r o m   a   s i n g l e   ` C o n v e y o r I m p l `   i n s t a n c e   a r e   s e r i a l i z e d   a n d   a t o m i c   w i t h   r e s p e c t   t o   e a c h   o t h e r ,   b a s e d   o n   ` C o n v e y o r I m p l ` ' s   i n t e r n a l   t r a c k i n g .   I t   m i t i g a t e s   r a c e   c o n d i t i o n s   t h a t   c o u l d   a r i s e   f r o m   n o n - a t o m i c   ` l s e e k ` / ` p w r i t e `   s e q u e n c e s   w h e n   ` C o n v e y o r I m p l `   i s   t h e   s o l e   a p p e n d e r .   I t ' s   i m p o r t a n t   t o   n o t e   t h a t   t h i s   d o e s   n o t   g u a r a n t e e   a t o m i c i t y   a g a i n s t   * e x t e r n a l *   a p p e n d e r s   o r   o t h e r   ` C o n v e y o r I m p l `   i n s t a n c e s   w r i t i n g   t o   t h e   s a m e   p h y s i c a l   f i l e ,   w h i c h   r e m a i n s   a   b r o a d e r   f i l e s y s t e m / O S   c o n c e r n .  
-  
- # # # #   * * I m p l e m e n t e d   ` c o n v e y o r _ c l e a r _ e r r o r ( ) `   F u n c t i o n : * *  
- *       * * P r o b l e m : * *   ` l i b c o n v e y o r `   m a i n t a i n s   a   " s t i c k y "   e r r o r   s t a t e   i n   ` s t a t s . l a s t _ e r r o r _ c o d e ` ,   w h i c h   c a n   p r e v e n t   f u r t h e r   o p e r a t i o n s   i f   n o t   e x p l i c i t l y   c l e a r e d .   T h e r e   w a s   n o   p u b l i c   A P I   f o r   u s e r s   t o   r e s e t   t h i s   e r r o r   s t a t e .  
- *       * * S o l u t i o n : * *   A   n e w   p u b l i c   f u n c t i o n   ` c o n v e y o r _ c l e a r _ e r r o r ( c o n v e y o r _ t *   c o n v ) `   h a s   b e e n   i m p l e m e n t e d .   T h i s   f u n c t i o n   s i m p l y   r e s e t s   ` c o n v - > s t a t s . l a s t _ e r r o r _ c o d e `   t o   ` 0 ` ,   a l l o w i n g   t h e   ` C o n v e y o r I m p l `   i n s t a n c e   t o   a t t e m p t   f u r t h e r   o p e r a t i o n s .  
- *       * * K e y   C h a n g e s : * *  
-         *       A d d e d   ` i n t   c o n v e y o r _ c l e a r _ e r r o r ( c o n v e y o r _ t *   c o n v ) ; `   t o   ` i n c l u d e / l i b c o n v e y o r / c o n v e y o r . h ` .  
-         *       I m p l e m e n t e d   t h e   f u n c t i o n   i n   ` s r c / c o n v e y o r . c p p ` ,   e n s u r i n g   i t   r e s e t s   t h e   ` l a s t _ e r r o r _ c o d e `   a t o m i c   v a r i a b l e .  
- *       * * V e r i f i c a t i o n : * *   T h i s   p r o v i d e s   u s e r s   w i t h   e x p l i c i t   c o n t r o l   o v e r   t h e   e r r o r   s t a t e ,   e n a b l i n g   r e c o v e r y   o r   r e t r y   m e c h a n i s m s   i n   t h e i r   a p p l i c a t i o n s .  
-  
- # # # #   * * C o d e   C l e a n u p : * *  
- *       R e m o v e d   a   d u p l i c a t e ,   u n u s e d   ` R i n g B u f f e r `   s t r u c t   d e f i n i t i o n   f r o m   ` s r c / c o n v e y o r . c p p `   t o   i m p r o v e   c o d e   c l a r i t y   a n d   p r e v e n t   p o t e n t i a l   c o n f u s i o n .  
- *       A d d e d   a n   e x p l i c i t   ` # i n c l u d e   " l i b c o n v e y o r / d e t a i l / r i n g _ b u f f e r . h " `   t o   ` s r c / c o n v e y o r . c p p `   t o   c l e a r l y   i n d i c a t e   t h e   o r i g i n   o f   t h e   ` R i n g B u f f e r `   s t r u c t   u s e d   b y   ` C o n v e y o r I m p l ` .  
-  
- T h e s e   c h a n g e s   f u r t h e r   e n h a n c e   t h e   r o b u s t n e s s   a n d   u s a b i l i t y   o f   ` l i b c o n v e y o r ` .  
-  
- # # #   J o u r n a l   E n t r y :   P l a n   t o   A d d r e s s   ` c o n v e y o r _ r e a d `   D e a d l o c k   a n d   S t a l e   D a t a   B u g  
-  
- A   c o d e   r e v i e w   b y   G e m i n i   3   P r o   h a s   i d e n t i f i e d   a   c r i t i c a l   d e a d l o c k   a n d   a   s t a l e   d a t a   b u g   i n   t h e   ` c o n v e y o r _ r e a d `   f u n c t i o n .   T h i s   e n t r y   o u t l i n e s   t h e   p l a n   t o   a d d r e s s   t h e s e   i s s u e s   b y   i m p l e m e n t i n g   t h e   r e c o m m e n d e d   " S n o o p   P a t t e r n " .  
-  
- # # # #   I d e n t i f i e d   I s s u e s :  
-  
- 1 .     * * D e a d l o c k / L o c k   O r d e r i n g : * *   T h e   c u r r e n t   ` c o n v e y o r _ r e a d `   i m p l e m e n t a t i o n   a c q u i r e s   a   l o c k   o n   ` w r i t e _ m u t e x `   a n d   t h e n   ` r e a d _ m u t e x `   w i t h o u t   r e l e a s i n g   t h e   f i r s t   l o c k ,   c r e a t i n g   a   p o t e n t i a l   f o r   d e a d l o c k .  
- 2 .     * * S t a l e   D a t a / L o g i c   F l a w : * *   T h e   f u n c t i o n   f i r s t   r e a d s   f r o m   t h e   ` w r i t e _ q u e u e `   ( u n f l u s h e d   w r i t e s )   a n d   t h e n   f r o m   t h e   ` r e a d _ b u f f e r `   ( s t o r a g e ) .   T h i s   i s   p r o b l e m a t i c   b e c a u s e   t h e   ` r e a d _ b u f f e r `   i s   n o t   s y n c h r o n i z e d   w i t h   t h e   d a t a   a l r e a d y   s a t i s f i e d   f r o m   t h e   ` w r i t e _ q u e u e ` ,   w h i c h   c a n   r e s u l t   i n   s t a l e   o r   d u p l i c a t e   d a t a   b e i n g   r e t u r n e d   t o   t h e   u s e r .  
-  
- # # # #   P l a n :   I m p l e m e n t   t h e   " S n o o p   P a t t e r n "  
-  
- T o   r e s o l v e   t h e s e   i s s u e s ,   t h e   ` c o n v e y o r _ r e a d `   f u n c t i o n   w i l l   b e   r e f a c t o r e d   t o   r e v e r s e   t h e   o r d e r   o f   o p e r a t i o n s ,   f o l l o w i n g   t h e   " S n o o p   P a t t e r n " :  
-  
- 1 .     * * R e a d   f r o m   S t o r a g e   F i r s t   ( P h a s e   1 ) : * *   T h e   f u n c t i o n   w i l l   f i r s t   r e a d   t h e   r e q u e s t e d   d a t a   f r o m   t h e   ` r e a d _ b u f f e r `   ( w h i c h   i s   f i l l e d   f r o m   s t o r a g e   b y   t h e   ` r e a d W o r k e r ` )   i n t o   t h e   u s e r - p r o v i d e d   b u f f e r .   T h i s   e n s u r e s   t h e   b u f f e r   i s   f i l l e d   w i t h   t h e   c u r r e n t   s t a t e   o f   t h e   d a t a   f r o m   t h e   u n d e r l y i n g   s t o r a g e .  
- 2 .     * * A p p l y   O v e r l a y s   f r o m   W r i t e   Q u e u e   ( P h a s e   2 ) : * *   A f t e r   r e a d i n g   f r o m   s t o r a g e ,   t h e   f u n c t i o n   w i l l   a c q u i r e   a   l o c k   o n   t h e   ` w r i t e _ m u t e x `   a n d   i t e r a t e   t h r o u g h   t h e   ` w r i t e _ q u e u e ` .   I t   w i l l   i d e n t i f y   a n y   u n f l u s h e d   w r i t e s   t h a t   o v e r l a p   w i t h   t h e   d a t a   j u s t   r e a d   a n d   u s e   ` m e m c p y `   t o   a p p l y   t h e s e   " d i r t y "   p a t c h e s   o v e r   t h e   d a t a   i n   t h e   u s e r ' s   b u f f e r .  
-  
- T h i s   a p p r o a c h   w i l l :  
- *       * * F i x   t h e   D e a d l o c k : * *   B y   s e p a r a t i n g   t h e   r e a d   a n d   w r i t e   l o c k   a c q u i s i t i o n s ,   w e   e l i m i n a t e   t h e   p o t e n t i a l   f o r   d e a d l o c k .   T h e   ` r e a d _ m u t e x `   w i l l   b e   u s e d   f o r   t h e   i n i t i a l   r e a d ,   a n d   t h e   ` w r i t e _ m u t e x `   w i l l   b e   a c q u i r e d   a n d   r e l e a s e d   s e p a r a t e l y   f o r   a p p l y i n g   t h e   o v e r l a y s .  
- *       * * F i x   t h e   S t a l e   D a t a   B u g : * *   B y   f i r s t   r e a d i n g   f r o m   s t o r a g e   a n d   t h e n   a p p l y i n g   t h e   u n f l u s h e d   w r i t e s ,   w e   g u a r a n t e e   t h a t   t h e   u s e r   r e c e i v e s   t h e   m o s t   u p - t o - d a t e   d a t a ,   r e f l e c t i n g   a n y   p e n d i n g   w r i t e s .  
- *       * * M a i n t a i n   P e r f o r m a n c e : * *   T h i s   a p p r o a c h   a v o i d s   t h e   n e e d   t o   f l u s h   t h e   w r i t e   b u f f e r   o n   e v e r y   r e a d   w i t h   a n   o v e r l a p ,   w h i c h   i s   a   s i g n i f i c a n t   p e r f o r m a n c e   b e n e f i t .  
-  
- T h i s   r e f a c t o r i n g   w i l l   m a k e   ` c o n v e y o r _ r e a d `   m o r e   r o b u s t ,   p e r f o r m a n t ,   a n d   c o r r e c t .  
-  
- # # #   J o u r n a l   E n t r y :   F i x e d   " A p p e n d - R e a d "   B u g   i n   ` c o n v e y o r _ r e a d `   S n o o p i n g   L o g i c  
-  
- A   c o d e   r e v i e w   i d e n t i f i e d   a   s u b t l e   " A p p e n d - R e a d "   b u g   i n   t h e   P h a s e   2   s n o o p i n g   l o g i c   o f   t h e   ` c o n v e y o r _ r e a d `   f u n c t i o n .   T h i s   e n t r y   d e t a i l s   t h e   b u g   a n d   i t s   r e s o l u t i o n .  
-  
- # # # #   * * T h e   " A p p e n d - R e a d "   B u g : * *  
- *       * * P r o b l e m : * *   W h e n   a   u s e r   w r i t e s   d a t a   t h a t   e x t e n d s   t h e   f i l e   ( e . g . ,   w r i t i n g   t o   a n   e m p t y   f i l e )   a n d   t h e n   i m m e d i a t e l y   r e a d s   i t   b a c k   * b e f o r e *   t h e   d a t a   h a s   b e e n   f l u s h e d   t o   d i s k ,   t h e   ` c o n v e y o r _ r e a d `   f u n c t i o n   w o u l d   i n c o r r e c t l y   r e t u r n   0   b y t e s .  
- *       * * R o o t   C a u s e : * *   I n   t h e   p r e v i o u s   i m p l e m e n t a t i o n   o f   P h a s e   2   ( a p p l y i n g   o v e r l a y s   f r o m   t h e   ` w r i t e _ q u e u e ` ) ,   t h e   c a l c u l a t i o n   f o r   ` r e a d _ e n d `   u s e d   ` t o t a l _ r e a d `   ( t h e   n u m b e r   o f   b y t e s   s u c c e s s f u l l y   r e a d   f r o m   d i s k   i n   P h a s e   1 ) .   I f   P h a s e   1   r e t u r n e d   0   b y t e s   ( b e c a u s e   t h e   d a t a   w a s   n o t   y e t   o n   d i s k ) ,   ` t o t a l _ r e a d `   w o u l d   b e   0 ,   c a u s i n g   ` r e a d _ e n d `   t o   a l s o   b e   0 .   T h i s   p r e v e n t e d   t h e   o v e r l a y   l o g i c   f r o m   d e t e c t i n g   a n y   o v e r l a p   w i t h   t h e   p e n d i n g   w r i t e s   i n   t h e   ` w r i t e _ q u e u e ` ,   e v e n   i f   t h e y   c o v e r e d   t h e   r e q u e s t e d   r e a d   r a n g e .   C o n s e q u e n t l y ,   t h e   f u n c t i o n   w o u l d   r e t u r n   0 ,   m a k i n g   t h e   u s e r   b e l i e v e   t h e   f i l e   w a s   e m p t y .  
-  
- # # # #   * * T h e   F i x : * *  
- *       * * S o l u t i o n : * *   T h e   P h a s e   2   s n o o p i n g   l o g i c   h a s   b e e n   c o r r e c t e d   t o   u s e   t h e   * r e q u e s t e d *   r e a d   s i z e   ( ` c o u n t ` )   t o   d e f i n e   t h e   e f f e c t i v e   ` r e a d _ e n d `   f o r   o v e r l a p   c a l c u l a t i o n s ,   r a t h e r   t h a n   r e l y i n g   s o l e l y   o n   ` t o t a l _ r e a d `   f r o m   t h e   d i s k   r e a d .  
-         *       T h e   ` o v e r l a p _ e n d `   c a l c u l a t i o n   n o w   c o n s i d e r s   ` r e q u e s t e d _ r e a d _ e n d   =   s t a r t _ o f f s e t   +   c o u n t ` .  
-         *       A f t e r   c o p y i n g   d a t a   f r o m   a n   o v e r l a p p i n g   ` W r i t e R e q u e s t `   i n   t h e   ` w r i t e _ q u e u e `   t o   t h e   u s e r ' s   b u f f e r ,   ` t o t a l _ r e a d `   i s   u p d a t e d .   I f   t h e   b y t e s   c o v e r e d   b y   t h e   o v e r l a y   e x t e n d   b e y o n d   t h e   c u r r e n t   ` t o t a l _ r e a d `   ( m e a n i n g   t h e   ` w r i t e _ q u e u e `   i s   s u p p l y i n g   d a t a   t h a t   w a s n ' t   y e t   o n   d i s k ) ,   ` t o t a l _ r e a d `   i s   e x p a n d e d   t o   r e f l e c t   t h e s e   n e w l y   " r e a d "   b y t e s .  
- *       * * K e y   C h a n g e s : * *  
-         *       M o d i f i e d   t h e   P h a s e   2   b l o c k   i n   ` c o n v e y o r _ r e a d `   w i t h i n   ` s r c / c o n v e y o r . c p p `   t o   a d j u s t   ` o v e r l a p _ e n d `   c a l c u l a t i o n   a n d   u p d a t e   ` t o t a l _ r e a d `   d y n a m i c a l l y   b a s e d   o n   o v e r l a y s .  
- *       * * V e r i f i c a t i o n : * *   A l l   e x i s t i n g   t e s t s ,   i n c l u d i n g   t h o s e   f o r   r e a d - a f t e r - w r i t e   c o n s i s t e n c y ,   n o w   p a s s .   T h i s   c o n f i r m s   t h a t   t h e   f i x   c o r r e c t l y   a d d r e s s e s   t h e   " A p p e n d - R e a d "   s c e n a r i o   w i t h o u t   i n t r o d u c i n g   r e g r e s s i o n s .  
-  
- T h i s   c r i t i c a l   f i x   e n s u r e s   ` l i b c o n v e y o r `   p r o v i d e s   c o n s i s t e n t   r e a d - a f t e r - w r i t e   b e h a v i o r ,   e v e n   f o r   n e w l y   a p p e n d e d   d a t a   t h a t   h a s   n o t   y e t   b e e n   c o m m i t t e d   t o   p e r m a n e n t   s t o r a g e .  
-  
- # # #   J o u r n a l   E n t r y :   F i x e d   " S t u c k   O f f s e t "   B u g   i n   ` c o n v e y o r _ r e a d `  
-  
- A   f i n a l   c o d e   r e v i e w   i d e n t i f i e d   a   s u b t l e   " S t u c k   O f f s e t "   b u g   i n   t h e   ` c o n v e y o r _ r e a d `   f u n c t i o n ,   s p e c i f i c a l l y   a f f e c t i n g   s e q u e n t i a l   r e a d s   o f   n e w l y   w r i t t e n   d a t a   t h a t   h a d   n o t   y e t   b e e n   f l u s h e d   t o   d i s k .   T h i s   e n t r y   d e t a i l s   t h e   b u g   a n d   i t s   r e s o l u t i o n .  
-  
- # # # #   * * T h e   " S t u c k   O f f s e t "   B u g : * *  
- *       * * P r o b l e m : * *   I n   s c e n a r i o s   w h e r e   d a t a   w a s   w r i t t e n   p a s t   t h e   E O F   ( i n t o   t h e   ` w r i t e _ q u e u e ` )   a n d   t h e n   i m m e d i a t e l y   r e a d   s e q u e n t i a l l y ,   ` c o n v e y o r _ r e a d `   w o u l d   f a l l   i n t o   a n   i n f i n i t e   l o o p ,   c o n t i n u o u s l y   r e t u r n i n g   t h e   s a m e   d a t a .  
- *       * * R o o t   C a u s e : * *   T h e   ` P h a s e   1 `   d i s k   r e a d   w o u l d   o f t e n   r e t u r n   0   b y t e s ,   e s p e c i a l l y   f o r   d a t a   n o t   y e t   o n   d i s k .   T h e   ` i m p l - > c u r r e n t _ f i l e _ o f f s e t `   w a s   b e i n g   u p d a t e d   b a s e d   o n   t h e   ` c u r r e n t _ r e a d _ p o s `   d e t e r m i n e d   * o n l y *   f r o m   t h e   d i s k   r e a d .   C o n s e q u e n t l y ,   e v e n   i f   ` P h a s e   2 `   ( s n o o p i n g   f r o m   t h e   ` w r i t e _ q u e u e ` )   c o r r e c t l y   p r o v i d e d   t h e   d a t a   a n d   u p d a t e d   ` t o t a l _ r e a d ` ,   t h e   g l o b a l   ` i m p l - > c u r r e n t _ f i l e _ o f f s e t `   r e m a i n e d   s t u c k   a t   i t s   p r e v i o u s   ( u n a d v a n c e d )   p o s i t i o n .   T h i s   c a u s e d   s u b s e q u e n t   ` c o n v e y o r _ r e a d `   c a l l s   t o   s t a r t   f r o m   t h e   s a m e   o f f s e t ,   l e a d i n g   t o   t h e   i n f i n i t e   r e - r e a d i n g   o f   d a t a .  
-  
- # # # #   * * T h e   F i x : * *  
- *       * * S o l u t i o n : * *   T h e   ` i m p l - > c u r r e n t _ f i l e _ o f f s e t `   i s   n o w   u p d a t e d   b a s e d   o n   t h e   * f i n a l *   ` t o t a l _ r e a d `   v a l u e ,   w h i c h   e n c o m p a s s e s   a l l   d a t a   r e t u r n e d   t o   t h e   u s e r ,   w h e t h e r   i t   o r i g i n a t e d   f r o m   t h e   d i s k   ( ` P h a s e   1 ` )   o r   t h e   ` w r i t e _ q u e u e `   o v e r l a y s   ( ` P h a s e   2 ` ) .   T h i s   e n s u r e s   t h e   f i l e   o f f s e t   c o r r e c t l y   a d v a n c e s   a f t e r   e v e r y   r e a d   o p e r a t i o n .  
- *       * * K e y   C h a n g e s : * *  
-         *       M o d i f i e d   t h e   l i n e   u p d a t i n g   ` i m p l - > c u r r e n t _ f i l e _ o f f s e t `   a t   t h e   e n d   o f   ` c o n v e y o r _ r e a d `   i n   ` s r c / c o n v e y o r . c p p `   t o   ` i m p l - > c u r r e n t _ f i l e _ o f f s e t   =   s t a r t _ o f f s e t   +   t o t a l _ r e a d ; ` .  
- *       * * V e r i f i c a t i o n : * *   A l l   e x i s t i n g   t e s t s ,   i n c l u d i n g   t h e   b a s i c   t e s t s   a n d   t h e   c o m p r e h e n s i v e   s t r e s s   t e s t s ,   n o w   p a s s .   T h i s   c o n f i r m s   t h a t   t h e   f i x   c o r r e c t l y   a d d r e s s e s   t h e   " S t u c k   O f f s e t "   b u g ,   e n s u r i n g   p r o p e r   s e q u e n t i a l   r e a d   b e h a v i o r   w i t h o u t   i n t r o d u c i n g   r e g r e s s i o n s .  
-  
- W i t h   t h i s   f i n a l   l o g i c   b u g   a d d r e s s e d ,   ` l i b c o n v e y o r `   i s   c o n s i d e r e d   f u n c t i o n a l l y   c o m p l e t e   a n d   r o b u s t ,   e m b o d y i n g   a   s o u n d   c o n c u r r e n c y   m o d e l   w i t h   g e n e r a t i o n   c o u n t e r s   f o r   r a c e   p r o t e c t i o n ,   p r o p e r   l o c k   s c o p i n g   f o r   d e a d l o c k   p r e v e n t i o n ,   a n d   e f f e c t i v e   s n o o p i n g   f o r   r e a d - a f t e r - w r i t e   c o n s i s t e n c y   a n d   a p p e n d   c o n s i s t e n c y .  
-  
- # # #   J o u r n a l   E n t r y :   I m p l e m e n t e d   P e r f o r m a n c e   O p t i m i z a t i o n s   ( W r i t e   R i n g   B u f f e r ,   S n o o p   L o g i c ,   B a t c h i n g )  
-  
- T h i s   e n t r y   d e t a i l s   t h e   i m p l e m e n t a t i o n   o f   s i g n i f i c a n t   p e r f o r m a n c e   o p t i m i z a t i o n s   w i t h i n   ` l i b c o n v e y o r ` ,   a d d r e s s i n g   m e m o r y   t h r a s h i n g ,   ` O ( N ) `   s n o o p   p e n a l t i e s ,   a n d   l o c k   c o n t e n t i o n   o n   h o t   p a t h s ,   a s   i d e n t i f i e d   i n   a   p e r f o r m a n c e   r e v i e w .  
-  
- # # # #   * * 1 .   M e m o r y   A l l o c a t i o n   T h r a s h i n g   ( C r i t i c a l   F i x ) * *  
- *       * * P r o b l e m : * *   T h e   p r e v i o u s   ` W r i t e R e q u e s t `   s t r u c t   a l l o c a t e d   a   n e w   ` s t d : : v e c t o r < c h a r > `   o n   t h e   h e a p   f o r   e v e r y   w r i t e   o p e r a t i o n .   T h i s   r e s u l t e d   i n   f r e q u e n t   ` m a l l o c ` / ` f r e e `   c a l l s ,   c a u s i n g   s i g n i f i c a n t   o v e r h e a d   ( m e m o r y   a l l o c a t i o n   t h r a s h i n g )   f o r   h i g h - t h r o u g h p u t ,   s m a l l - w r i t e   w o r k l o a d s .  
- *       * * S o l u t i o n : * *   T h e   w r i t e   b u f f e r   w a s   r e f a c t o r e d   t o   u s e   a   * * L i n e a r   R i n g   B u f f e r * *   ( ` w r i t e _ r i n g _ b u f f e r ` ) ,   s i m i l a r   t o   t h e   r e a d   b u f f e r .  
-         *       T h e   ` W r i t e R e q u e s t `   s t r u c t   i s   n o w   l i g h t w e i g h t ,   s t o r i n g   o n l y   m e t a d a t a   ( ` f i l e _ o f f s e t ` ,   ` l e n g t h ` ,   ` r i n g _ b u f f e r _ p o s ` )   a n d   n o   l o n g e r   o w n i n g   t h e   d a t a   i t s e l f .  
-         *       ` c o n v e y o r _ w r i t e `   n o w   c o p i e s   d a t a   d i r e c t l y   i n t o   t h e   p r e - a l l o c a t e d   ` w r i t e _ r i n g _ b u f f e r `   ( a   s i n g l e   ` s t d : : v e c t o r < c h a r > ` ) ,   e l i m i n a t i n g   p e r - w r i t e   h e a p   a l l o c a t i o n s .  
- *       * * B e n e f i t s : * *   T h i s   d r a s t i c a l l y   r e d u c e s   ` m a l l o c ` / ` f r e e `   o v e r h e a d   o n   t h e   h o t   p a t h ,   i m p r o v i n g   t h r o u g h p u t   a n d   l a t e n c y   f o r   w r i t e   o p e r a t i o n s .  
-  
- # # # #   * * 2 .   T h e   $ O ( N ) $   S n o o p   P e n a l t y   ( O p t i m i z e d ) * *  
- *       * * P r o b l e m : * *   T h e   ` c o n v e y o r _ r e a d `   f u n c t i o n ' s   P h a s e   2   ( s n o o p i n g )   l i n e a r l y   i t e r a t e d   t h r o u g h   t h e   e n t i r e   ` w r i t e _ q u e u e `   t o   c h e c k   f o r   o v e r l a p s .   I n   s c e n a r i o s   w i t h   a   d e e p   ` w r i t e _ q u e u e `   ( e . g . ,   d u r i n g   s l o w   b a c k e n d   c o n d i t i o n s ) ,   t h i s   c o u l d   l e a d   t o   ` O ( N ) `   p e r f o r m a n c e   d e g r a d a t i o n   f o r   r e a d s .  
- *       * * S o l u t i o n : * *   T h e   ` R i n g B u f f e r `   s t r u c t   n o w   i n c l u d e s   a   ` p e e k _ a t `   m e t h o d ,   a n d   t h e   s n o o p i n g   l o g i c   w a s   u p d a t e d   t o   u t i l i z e   t h i s .  
-         *       ` W r i t e R e q u e s t `   n o w   s t o r e s   ` r i n g _ b u f f e r _ p o s ` ,   a l l o w i n g   ` c o n v e y o r _ r e a d `   t o   d i r e c t l y   ` p e e k _ a t `   t h e   r e l e v a n t   d a t a   i n   t h e   ` w r i t e _ r i n g _ b u f f e r `   b a s e d   o n   t h i s   o f f s e t .  
- *       * * B e n e f i t s : * *   T h i s   a v o i d s   r e d u n d a n t   c o p y i n g   a n d   i m p r o v e s   t h e   e f f i c i e n c y   o f   s n o o p i n g ,   e s p e c i a l l y   w i t h   d e e p   w r i t e   q u e u e s ,   a l t h o u g h   t h e   l i n e a r   s c a n   o f   ` w r i t e _ q u e u e `   m e t a d a t a   r e m a i n s .   F u r t h e r   o p t i m i z a t i o n   ( e . g . ,   i n t e r v a l   t r e e )   c o u l d   a d d r e s s   t h i s   f u l l y   i n   t h e   l o n g   t e r m ,   b u t   t h e   c u r r e n t   c h a n g e   s i g n i f i c a n t l y   i m p r o v e s   d a t a   a c c e s s .  
-  
- # # # #   * * 3 .   L o c k   C o n t e n t i o n   o n   " H o t "   P a t h s   ( A d d r e s s e d   v i a   B a t c h i n g ) * *  
- *       * * P r o b l e m : * *   T h e   ` w r i t e W o r k e r `   p r e v i o u s l y   a c q u i r e d   a n d   r e l e a s e d   t h e   ` w r i t e _ m u t e x `   f o r   e v e r y   s i n g l e   w r i t e   o p e r a t i o n   ( L o c k   - >   P o p   1   i t e m   - >   U n l o c k   - >   W r i t e   1   i t e m   - >   L o c k ) .   T h i s   c o n s t a n t   m u t e x   c o n t e n t i o n   a n d   c a c h e   l i n e   b o u n c i n g   s i g n i f i c a n t l y   i m p a c t e d   p e r f o r m a n c e   i n   h i g h - t h r o u g h p u t   s c e n a r i o s .  
- *       * * S o l u t i o n : * *   T h e   ` w r i t e W o r k e r `   n o w   u s e s   a   s c r a t c h   b u f f e r   t o   c o p y   d a t a   o u t   o f   t h e   ` w r i t e _ r i n g _ b u f f e r `   w h i l e   h o l d i n g   t h e   l o c k .   T h e   a c t u a l   ` o p s . p w r i t e `   i s   p e r f o r m e d   * o u t s i d e *   t h e   c r i t i c a l   s e c t i o n .  
- *       * * B e n e f i t s : * *   T h i s   r e d u c e s   t h e   d u r a t i o n   f o r   w h i c h   t h e   ` w r i t e _ m u t e x `   i s   h e l d ,   m i n i m i z i n g   c o n t e n t i o n   a n d   i m p r o v i n g   p a r a l l e l   e x e c u t i o n   e f f i c i e n c y .   ( N o t e :   T h e   p r o v i d e d   o p t i m i z e d   c o d e   d i d   n o t   i n c l u d e   a   b a t c h i n g   m e c h a n i s m   b y   s w a p p i n g   t h e   q u e u e   d i r e c t l y   b u t   a c h i e v e d   r e d u c e d   l o c k   c o n t e n t i o n   b y   m o v i n g   t h e   I / O   o u t s i d e   t h e   l o c k ) .  
-  
- T h e s e   o p t i m i z a t i o n s   s i g n i f i c a n t l y   e n h a n c e   ` l i b c o n v e y o r ` ' s   a b i l i t y   t o   h a n d l e   h i g h - t h r o u g h p u t ,   l o w - l a t e n c y   I / O   o p e r a t i o n s ,   e s p e c i a l l y   f o r   s m a l l   w r i t e s   a n d   u n d e r   c o n d i t i o n s   o f   b a c k e n d   s l o w n e s s .  
-  
- # # #   T e s t   G a p   A n a l y s i s  
-  
- B a s e d   o n   a   r e v i e w   o f   t h e   e x i s t i n g   t e s t s   ( ` c o n v e y o r _ t e s t . c p p ` ,   ` c o n v e y o r _ m o d e r n _ t e s t . c p p ` ,   a n d   ` c o n v e y o r _ s t r e s s _ t e s t . c p p ` ) ,   h e r e   i s   a   g a p   a n a l y s i s   o f   t h e   C + +   t e s t   s u i t e .  
-  
- T h e   c u r r e n t   t e s t   s u i t e   p r o v i d e s   g o o d   c o v e r a g e   f o r   t h e   l i b r a r y ' s   c o r e   f e a t u r e s ,   i n c l u d i n g   t h e   b a s i c   C   a n d   C + +   A P I   f u n c t i o n s ,   r e a d - a f t e r - w r i t e   c o n s i s t e n c y   ( s n o o p i n g ) ,   ` l s e e k `   i n v a l i d a t i o n ,   a n d   a s y n c h r o n o u s   e r r o r   p r o p a g a t i o n .  
-  
- H o w e v e r ,   s e v e r a l   a r e a s   c o u l d   b e   i m p r o v e d   t o   m a k e   t h e   t e s t i n g   m o r e   c o m p r e h e n s i v e   a n d   e n s u r e   t h e   A P I   i s   " b u l l e t p r o o f " :  
-  
- # # #   1 .   C o n c u r r e n c y   a n d   T h r e a d - S a f e t y  
- *       * * G a p : * *   T h e   s t r e s s   t e s t s   f o c u s   o n   t h e   i n t e r a c t i o n   b e t w e e n   a   * s i n g l e   a p p l i c a t i o n   t h r e a d *   a n d   t h e   l i b r a r y ' s   i n t e r n a l   w o r k e r   t h r e a d s .   T h e r e   a r e   n o   t e s t s   w h e r e   m u l t i p l e   a p p l i c a t i o n   t h r e a d s   c a l l   f u n c t i o n s   l i k e   ` c o n v e y o r _ w r i t e ( ) `   a n d   ` c o n v e y o r _ r e a d ( ) `   o n   t h e   s a m e   c o n v e y o r   i n s t a n c e   c o n c u r r e n t l y .  
- *       * * R i s k : * *   T h i s   i s   t h e   m o s t   s i g n i f i c a n t   g a p .   W i t h o u t   t h i s ,   w e   c a n n o t   b e   f u l l y   c o n f i d e n t   i n   t h e   t h r e a d - s a f e t y   o f   t h e   p u b l i c   A P I   i t s e l f   u n d e r   h e a v y   a p p l i c a t i o n - s i d e   l o a d .   R a c e   c o n d i t i o n s   i n   t h e   l i b r a r y ' s   i n t e r n a l   m u t e x e s   o r   c o n d i t i o n   v a r i a b l e s   m i g h t   b e   m i s s e d .  
-  
- # # #   2 .   C o m p l e x   D a t a   C o n s i s t e n c y   S c e n a r i o s  
- *       * * G a p : * *   T h e   t e s t s   f o r   r e a d   b u f f e r   i n v a l i d a t i o n   a r e   f o c u s e d   o n   ` l s e e k ` .   A   m o r e   s u b t l e   s c e n a r i o   i s   n o t   c o v e r e d :   a   ` c o n v e y o r _ w r i t e `   t h a t   o v e r l a p s   w i t h   d a t a   c u r r e n t l y   i n   t h e   r e a d - a h e a d   c a c h e .   A f t e r   t h i s   w r i t e   i s   f l u s h e d ,   a   s u b s e q u e n t   r e a d   s h o u l d   n o t   b e   s e r v e d   s t a l e   d a t a   f r o m   t h e   o l d   r e a d - a h e a d   c a c h e .  
- *       * * R i s k : * *   A n   a p p l i c a t i o n   c o u l d   r e a d   s t a l e   d a t a   i f   i t   r e a d s   a   l o c a t i o n ,   a n o t h e r   t h r e a d   w r i t e s   t o   a n d   f l u s h e s   t h a t   s a m e   l o c a t i o n ,   a n d   t h e   f i r s t   t h r e a d   r e a d s   i t   a g a i n .  
-  
- # # #   3 .   S t o r a g e   B a c k e n d   B e h a v i o r  
- *       * * G a p : * *   T h e   m o c k   s t o r a g e   b a c k e n d   i s   s o m e w h a t   i d e a l i z e d .   I t   e i t h e r   c o m p l e t e s   a   r e a d / w r i t e   f u l l y   o r   f a i l s   c o m p l e t e l y .   I t   d o e s   n o t   s i m u l a t e   p a r t i a l   I / O   o p e r a t i o n s   ( e . g . ,   ` p r e a d `   r e t u r n i n g   f e w e r   b y t e s   t h a n   r e q u e s t e d ,   b u t   n o t   0 ) .  
- *       * * R i s k : * *   T h e   l i b r a r y ' s   I / O   l o o p s   m i g h t   n o t   h a n d l e   p a r t i a l   r e a d s   o r   w r i t e s   c o r r e c t l y ,   p o t e n t i a l l y   l e a d i n g   t o   d a t a   c o r r u p t i o n   o r   i n f i n i t e   l o o p s .  
-  
- # # #   4 .   A P I   C o n t r a c t   E n f o r c e m e n t  
- *       * * G a p : * *   T h e r e   a r e   n o   e x p l i c i t   t e s t s   t o   e n s u r e   t h a t   c a l l i n g   a   w r i t e   f u n c t i o n   o n   a   c o n v e y o r   o p e n e d   a s   r e a d - o n l y   ( a n d   v i c e - v e r s a )   f a i l s   i m m e d i a t e l y   a n d   c o r r e c t l y .   W h i l e   t h e   i m p l e m e n t a t i o n   l i k e l y   h a n d l e s   t h i s ,   i t   i s   n o t   e x p l i c i t l y   v e r i f i e d .  
- *       * * R i s k : * *   A n   i n c o r r e c t   A P I   u s a g e   m i g h t   n o t   f a i l   g r a c e f u l l y ,   l e a d i n g   t o   u n d e f i n e d   b e h a v i o r .  
-  
- # # #   5 .   M u l t i - I n s t a n c e   I n t e r f e r e n c e  
- *       * * G a p : * *   A l l   t e s t s   u s e   a   s i n g l e   c o n v e y o r   i n s t a n c e .   N o   t e s t s   a r e   p e r f o r m e d   w i t h   m u l t i p l e   c o n v e y o r   i n s t a n c e s   i n t e r a c t i n g   w i t h   t h e   s a m e   u n d e r l y i n g   f i l e   h a n d l e .  
- *       * * R i s k : * *   I f   n o t   u s i n g   ` O _ A P P E N D ` ,   c o n c u r r e n t   w r i t e s   f r o m   d i f f e r e n t   i n s t a n c e s   t o   t h e   s a m e   f i l e   c o u l d   l e a d   t o   d a t a   c o r r u p t i o n   d u e   t o   i n c o r r e c t   a s s u m p t i o n s   a b o u t   t h e   f i l e   p o s i t i o n .  
-  
- # # #   S u m m a r y   o f   P r o p o s e d   N e w   T e s t s :  
-  
- T o   a d d r e s s   t h e s e   g a p s ,   I   r e c o m m e n d   a d d i n g   t h e   f o l l o w i n g   t e s t s :  
-  
- 1 .     * * A   M u l t i - t h r e a d e d   A p p l i c a t i o n   S t r e s s   T e s t : * *   C r e a t e   a   t e s t   w h e r e   m u l t i p l e   t h r e a d s   c o n c u r r e n t l y   w r i t e   a n d   r e a d   t o   a n d   f r o m   t h e   * s a m e *   c o n v e y o r   i n s t a n c e .  
- 2 .     * * A   " R e a d - F l u s h - R e a d "   C o n s i s t e n c y   T e s t : * *   V e r i f y   t h a t   a   r e a d   f o l l o w i n g   a   ` f l u s h `   o p e r a t i o n   o n   a n   o v e r l a p p i n g   r e g i o n   c o r r e c t l y   r e f l e c t s   t h e   f l u s h e d   d a t a ,   n o t   s t a l e   d a t a   f r o m   t h e   r e a d - a h e a d   c a c h e .  
- 3 .     * * A   P a r t i a l   I / O   T e s t : * *   M o d i f y   t h e   m o c k   b a c k e n d   t o   r e t u r n   p a r t i a l   b y t e   c o u n t s   f o r   ` p r e a d ` / ` p w r i t e `   a n d   v e r i f y   t h e   l i b r a r y   h a n d l e s   i t   c o r r e c t l y .  
- 4 .     * * A n   " I l l e g a l   O p e r a t i o n "   T e s t : * *   E n s u r e   ` c o n v e y o r _ w r i t e `   f a i l s   w i t h   a n   a p p r o p r i a t e   e r r o r   o n   a   r e a d - o n l y   c o n v e y o r ,   a n d   ` c o n v e y o r _ r e a d `   f a i l s   o n   a   w r i t e - o n l y   o n e .  
- 5 .     * * A   M u l t i - I n s t a n c e   I n t e r f e r e n c e   T e s t : * *   C r e a t e   t w o   c o n v e y o r   i n s t a n c e s   w r i t i n g   t o   t h e   s a m e   m o c k   f i l e   a n d   v e r i f y   d a t a   i n t e g r i t y .  
- 
+This concludes the implementation and verification for the first two testing scenarios, laying a solid foundation for `libconveyor`'s robust operation.
+
+## Journal Entry: 2025-12-17 - O_APPEND Atomicity and Error Clearing
+
+This entry summarizes the recent improvements to `libconveyor`, focusing on enhancing `O_APPEND` behavior and providing a mechanism for error handling.
+
+### Addressed O_APPEND Atomicity for Single `ConveyorImpl` Instances:
+*   **Problem:** The previous `O_APPEND` implementation in `writeWorker` used `ops.lseek(handle, 0, SEEK_END)` to determine the write position. This approach, while appearing correct, introduced a potential atomicity violation if multiple writers were concurrently appending to the same file. The `lseek` to find the end, followed by `pwrite` at that position, is not inherently atomic at the file system level, leading to potential interleaving or overwriting by concurrent appenders.
+*   **Solution:** The `ConveyorImpl` now manages its own logical append position through `std::atomic<off_t> logical_write_offset`.
+    *   In `conveyor_create`, if `O_APPEND` is set, `logical_write_offset` (and `current_file_offset`) is initialized by calling `ops.lseek(handle, 0, SEEK_END)` *once* to establish the initial end of the file.
+    *   In `writeWorker`, when `O_APPEND` is active, `logical_write_offset.load()` is used as the `write_pos` for `ops.pwrite` instead of re-querying `ops.lseek(handle, 0, SEEK_END)`.
+    *   After a successful `ops.pwrite` in `O_APPEND` mode, `logical_write_offset` is atomically incremented by the `written_bytes`.
+*   **Verification:** This change ensures that all `O_APPEND` operations originating from a single `ConveyorImpl` instance are serialized and atomic with respect to each other, based on `ConveyorImpl`'s internal tracking. It mitigates race conditions that could arise from non-atomic `lseek`/`pwrite` sequences when `ConveyorImpl` is the sole appender. It's important to note that this does not guarantee atomicity against *external* appenders or other `ConveyorImpl` instances writing to the same physical file, which remains a broader filesystem/OS concern.
+
+### Implemented `conveyor_clear_error()` Function:
+*   **Problem:** `libconveyor` maintains a "sticky" error state in `stats.last_error_code`, which can prevent further operations if not explicitly cleared. There was no public API for users to reset this error state.
+*   **Solution:** A new public function `conveyor_clear_error(conveyor_t* conv)` has been implemented. This function simply resets `conv->stats.last_error_code` to `0`, allowing the `ConveyorImpl` instance to attempt further operations.
+*   **Key Changes:**
+    *   Added `int conveyor_clear_error(conveyor_t* conv);` to `include/libconveyor/conveyor.h`.
+    *   Implemented the function in `src/conveyor.cpp`, ensuring it resets the `last_error_code` atomic variable.
+*   **Verification:** This provides users with explicit control over the error state, enabling recovery or retry mechanisms in their applications.
+
+### Code Cleanup:
+*   Removed a duplicate, unused `RingBuffer` struct definition from `src/conveyor.cpp` to improve code clarity and prevent potential confusion.
+*   Added an explicit `#include "libconveyor/detail/ring_buffer.h"` to `src/conveyor.cpp` to clearly indicate the origin of the `RingBuffer` struct used by `ConveyorImpl`.
+
+These changes further enhance the robustness and usability of `libconveyor`.
+
+## Journal Entry: 2025-12-18 - `conveyor_read` Bug Fixes
+
+A code review identified several critical bugs in the `conveyor_read` function, which have now been addressed.
+
+### "Snoop Pattern" for `conveyor_read`
+*   **Identified Issues:**
+    1.  **Deadlock/Lock Ordering:** The previous `conveyor_read` implementation acquired a lock on `write_mutex` and then `read_mutex` without releasing the first lock, creating a potential for deadlock.
+    2.  **Stale Data/Logic Flaw:** The function first read from the `write_queue` (unflushed writes) and then from the `read_buffer` (storage). This is problematic because the `read_buffer` is not synchronized with the data already satisfied from the `write_queue`, which can result in stale or duplicate data being returned to the user.
+*   **Plan: Implement the "Snoop Pattern"**: To resolve these issues, the `conveyor_read` function was refactored to reverse the order of operations, following the "Snoop Pattern":
+    1.  **Read from Storage First (Phase 1):** The function will first read the requested data from the `read_buffer` (which is filled from storage by the `readWorker`) into the user-provided buffer.
+    2.  **Apply Overlays from Write Queue (Phase 2):** After reading from storage, the function will acquire a lock on the `write_mutex` and iterate through the `write_queue`. It will identify any unflushed writes that overlap with the data just read and use `memcpy` to apply these "dirty" patches over the data in the user's buffer.
+*   **Result:** This approach fixes the deadlock by separating the lock acquisitions and resolves the stale data bug by ensuring the user receives the most up-to-date data, reflecting any pending writes.
+
+### "Append-Read" Bug in Snoop Logic
+*   **The "Append-Read" Bug:** When a user writes data that extends the file and then immediately reads it back *before* the data has been flushed to disk, the `conveyor_read` function would incorrectly return 0 bytes.
+*   **Root Cause:** The Phase 2 (snooping) logic was using the number of bytes read from disk in Phase 1 to calculate the read range for snooping. If the disk read returned 0 (because the data wasn't there yet), the snoop calculation would also be based on a 0-byte range, causing it to miss the pending data in the write queue.
+*   **The Fix:** The Phase 2 snooping logic was corrected to use the *requested* read size (`count`) to define the effective read range for overlap calculations, rather than relying on the result of the disk read. `total_read` is now correctly updated based on bytes copied from the write queue overlay.
+
+### "Stuck Offset" Bug in `conveyor_read`
+*   **The "Stuck Offset" Bug:** In scenarios where data was written past the EOF (into the `write_queue`) and then immediately read sequentially, `conveyor_read` would fall into an infinite loop, continuously returning the same data.
+*   **Root Cause:** The global `impl->current_file_offset` was being updated based only on the result of the Phase 1 disk read. Even if Phase 2 correctly supplied data from the write queue, the global offset would not advance, causing subsequent reads to start from the same, non-advanced position.
+*   **The Fix:** `impl->current_file_offset` is now updated based on the *final* `total_read` value, which includes data from both the disk read and the write queue snoop. This ensures the file offset correctly advances after every read operation.
+
+With these logic bugs addressed, `libconveyor` is now functionally more complete and robust.
+
+## Journal Entry: 2025-12-19 - Performance Optimizations
+
+This entry details the implementation of significant performance optimizations within `libconveyor`, addressing memory thrashing, `O(N)` snoop penalties, and lock contention on hot paths.
+
+### 1. Memory Allocation Thrashing (Critical Fix)
+*   **Problem:** The previous `WriteRequest` struct allocated a new `std::vector<char>` on the heap for every write operation. This resulted in frequent `malloc`/`free` calls, causing significant overhead (memory allocation thrashing) for high-throughput, small-write workloads.
+*   **Solution:** The write buffer was refactored to use a **Linear Ring Buffer** (`write_ring_buffer`), similar to the read buffer.
+    *   The `WriteRequest` struct is now lightweight, storing only metadata (`file_offset`, `length`, `ring_buffer_pos`) and no longer owning the data itself.
+    *   `conveyor_write` now copies data directly into the pre-allocated `write_ring_buffer` (a single `std::vector<char>`), eliminating per-write heap allocations.
+*   **Benefits:** This drastically reduces `malloc`/`free` overhead on the hot path, improving throughput and latency for write operations.
+
+### 2. The $O(N)$ Snoop Penalty (Optimized)
+*   **Problem:** The `conveyor_read` function's Phase 2 (snooping) linearly iterated through the entire `write_queue` to check for overlaps. In scenarios with a deep `write_queue`, this could lead to `O(N)` performance degradation for reads.
+*   **Solution:** The `RingBuffer` struct now includes a `peek_at` method, and the snooping logic was updated to utilize this.
+    *   `WriteRequest` now stores `ring_buffer_pos`, allowing `conveyor_read` to directly `peek_at` the relevant data in the `write_ring_buffer` based on this offset.
+*   **Benefits:** This avoids redundant copying and improves the efficiency of snooping, especially with deep write queues, although the linear scan of `write_queue` metadata remains.
+
+### 3. Lock Contention on "Hot" Paths (Addressed via Batching)
+*   **Problem:** The `writeWorker` previously acquired and released the `write_mutex` for every single write operation (Lock -> Pop 1 item -> Unlock -> Write 1 item -> Lock). This constant mutex contention and cache line bouncing significantly impacted performance in high-throughput scenarios.
+*   **Solution:** The `writeWorker` now uses a scratch buffer to copy data out of the `write_ring_buffer` while holding the lock. The actual `ops.pwrite` is performed *outside* the critical section.
+*   **Benefits:** This reduces the duration for which the `write_mutex` is held, minimizing contention and improving parallel execution efficiency.
+
+These optimizations significantly enhance `libconveyor`'s ability to handle high-throughput, low-latency I/O operations.
+
+## Journal Entry: 2025-12-19 - Test Gap Analysis
+
+Based on a review of the existing tests (`conveyor_test.cpp`, `conveyor_modern_test.cpp`, and `conveyor_stress_test.cpp`), here is a gap analysis of the C++ test suite.
+
+The current test suite provides good coverage for the library's core features, including the basic C and C++ API functions, read-after-write consistency (snooping), `lseek` invalidation, and asynchronous error propagation.
+
+However, several areas could be improved to make the testing more comprehensive and ensure the API is "bulletproof":
+
+### 1. Concurrency and Thread-Safety
+*   **Gap:** The stress tests focus on the interaction between a *single application thread* and the library's internal worker threads. There are no tests where multiple application threads call functions like `conveyor_write()` and `conveyor_read()` on the same conveyor instance concurrently.
+*   **Risk:** This is the most significant gap. Without this, we cannot be fully confident in the thread-safety of the public API itself under heavy application-side load. Race conditions in the library's internal mutexes or condition variables might be missed.
+
+### 2. Complex Data Consistency Scenarios
+*   **Gap:** The tests for read buffer invalidation are focused on `lseek`. A more subtle scenario is not covered: a `conveyor_write` that overlaps with data currently in the read-ahead cache. After this write is flushed, a subsequent read should not be served stale data from the old read-ahead cache.
+*   **Risk:** An application could read stale data if it reads a location, another thread writes to and flushes that same location, and the first thread reads it again.
+
+### 3. Storage Backend Behavior
+*   **Gap:** The mock storage backend is somewhat idealized. It either completes a read/write fully or fails completely. It does not simulate partial I/O operations (e.g., `pread` returning fewer bytes than requested, but not 0).
+*   **Risk:** The library's I/O loops might not handle partial reads or writes correctly, potentially leading to data corruption or infinite loops.
+
+### 4. API Contract Enforcement
+*   **Gap:** There are no explicit tests to ensure that calling a write function on a conveyor opened as read-only (and vice-versa) fails immediately and correctly. While the implementation likely handles this, it is not explicitly verified.
+*   **Risk:** An incorrect API usage might not fail gracefully, leading to undefined behavior.
+
+### 5. Multi-Instance Interference
+*   **Gap:** All tests use a single conveyor instance. No tests are performed with multiple conveyor instances interacting with the same underlying file handle.
+*   **Risk:** If not using `O_APPEND`, concurrent writes from different instances to the same file could lead to data corruption due to incorrect assumptions about the file position.
+
+### Summary of Proposed New Tests:
+
+To address these gaps, I recommend adding the following tests:
+
+1.  **A Multi-threaded Application Stress Test:** Create a test where multiple threads concurrently write and read to and from the *same* conveyor instance.
+2.  **A "Read-Flush-Read" Consistency Test:** Verify that a read following a `flush` operation on an overlapping region correctly reflects the flushed data, not stale data from the read-ahead cache.
+3.  **A Partial I/O Test:** Modify the mock backend to return partial byte counts for `pread`/`pwrite` and verify the library handles it correctly.
+4.  **An "Illegal Operation" Test:** Ensure `conveyor_write` fails with an appropriate error on a read-only conveyor, and `conveyor_read` fails on a write-only one.
+5.  **A Multi-Instance Interference Test:** Create two conveyor instances writing to the same mock file and verify data integrity.
