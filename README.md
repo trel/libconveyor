@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="libconveyor_logo.jpg" alt="libconveyor Logo" width="500"/>
+</p>
+
 # libconveyor: High-Performance I/O Buffering Library
 
 [![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](./LICENSE.md)
